@@ -495,6 +495,71 @@
       isSendingChanges || isFetchingChanges
     }
 
+    /// The result of the most recent request that sent local changes to CloudKit.
+    public struct SendOutcome: Equatable, Sendable {
+      /// When the request finished.
+      public var date: Date
+      /// Records saved and records deleted on the server.
+      public var savedCount: Int
+      /// Records whose save or delete failed.
+      public var failedCount: Int
+      /// Failed records per `CKError.Code` raw value, for example `[6: 250]`.
+      public var errorCodes: [Int: Int]
+      /// How long CloudKit asked the app to wait, if it said so (throttles).
+      public var retryAfterSeconds: Double?
+
+      /// True when CloudKit refused the request because of load: `serviceUnavailable` or
+      /// `requestRateLimited`. `CKSyncEngine` then waits for the system to schedule a retry,
+      /// which can take much longer than ``retryAfterSeconds``.
+      public var isThrottled: Bool {
+        errorCodes[CKError.Code.serviceUnavailable.rawValue] != nil
+          || errorCodes[CKError.Code.requestRateLimited.rawValue] != nil
+      }
+    }
+
+    /// The outcome of the most recent send, or `nil` before the first one.
+    ///
+    /// It is an observable value. Together with ``isSendingChanges`` and
+    /// ``pendingChangeCount()`` it tells a user why uploads are slow or paused.
+    public var lastSendOutcome: SendOutcome? {
+      observationRegistrar.access(self, keyPath: \.lastSendOutcome)
+      return _lastSendOutcome.withValue(\.self)
+    }
+    private let _lastSendOutcome = LockIsolated<SendOutcome?>(nil)
+
+    /// The number of local changes not yet sent: those held by the engines, those waiting in
+    /// the overflow table and those still being buffered.
+    public func pendingChangeCount() async -> Int {
+      let inEngines = syncEngines.withValue { engines in
+        [engines.private, engines.shared].compactMap { $0 }
+          .reduce(0) { $0 + $1.state.pendingRecordZoneChanges.count }
+      }
+      let buffered = pendingBudget.withValue { $0.buffer.count }
+      let inTable =
+        (try? await metadatabase.read { db in
+          try PendingRecordZoneChange.count().fetchOne(db)
+        }) ?? 0
+      return inEngines + buffered + (inTable ?? 0)
+    }
+
+    private func recordSendOutcome(
+      saved: Int,
+      failedSaves: [(record: CKRecord, error: CKError)],
+      failedDeletes: [CKRecord.ID: CKError]
+    ) {
+      let errors = failedSaves.map(\.error) + Array(failedDeletes.values)
+      let outcome = SendOutcome(
+        date: Date(),
+        savedCount: saved,
+        failedCount: errors.count,
+        errorCodes: Dictionary(grouping: errors, by: { $0.code.rawValue }).mapValues(\.count),
+        retryAfterSeconds: errors.compactMap(\.retryAfterSeconds).max()
+      )
+      observationRegistrar.withMutation(of: self, keyPath: \.lastSendOutcome) {
+        _lastSendOutcome.withValue { $0 = outcome }
+      }
+    }
+
     /// Stops the sync engine if it is running.
     ///
     /// All edits made after stopping the sync engine will not be synchronized to CloudKit.
@@ -1289,6 +1354,11 @@
         let deletedRecordIDs,
         let failedRecordDeletes
       ):
+        recordSendOutcome(
+          saved: savedRecords.count + deletedRecordIDs.count,
+          failedSaves: failedRecordSaves,
+          failedDeletes: failedRecordDeletes
+        )
         await handleSentRecordZoneChanges(
           savedRecords: savedRecords,
           failedRecordSaves: failedRecordSaves,

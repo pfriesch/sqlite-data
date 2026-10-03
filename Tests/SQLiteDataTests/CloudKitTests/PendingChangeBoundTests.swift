@@ -48,6 +48,36 @@
       }
 
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func sendOutcomeAndPendingCountReportTheQueue() async throws {
+        let bound = 100
+        syncEngine.maxInMemoryPendingChanges.setValue(bound)
+        #expect(syncEngine.lastSendOutcome == nil)
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Personal")
+            for id in 1...150 { Reminder(id: id, title: "R\(id)", remindersListID: 1) }
+          }
+        }
+        try await Task.sleep(for: .seconds(2))
+        #expect(await syncEngine.pendingChangeCount() == 151)
+
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+        try await Task.sleep(for: .milliseconds(500))
+        let outcome = try #require(syncEngine.lastSendOutcome)
+        #expect(outcome.savedCount > 0)
+        #expect(outcome.failedCount == 0)
+        #expect(!outcome.isThrottled)
+        #expect(await syncEngine.pendingChangeCount() < 151)
+
+        // The mock engine must end empty: drain it.
+        for _ in 0..<20 where await syncEngine.pendingChangeCount() > 0 {
+          try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+          try await Task.sleep(for: .milliseconds(300))
+        }
+        #expect(await syncEngine.pendingChangeCount() == 0)
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test func anOversizedStateIsSpilledToTheTableOnStart() async throws {
         let bound = 100
         syncEngine.maxInMemoryPendingChanges.setValue(bound)
