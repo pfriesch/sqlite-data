@@ -51,6 +51,42 @@
     /// with the number of pending changes (about 2 GB at 40k). Changes beyond this bound wait in
     /// the `sqlitedata_icloud_pendingRecordZoneChanges` table and are moved into the engine as it
     /// sends, see ``topUpPendingChanges()``.
+    /// Saved states above this size are not handed to `CKSyncEngine`.
+    ///
+    /// `CKSyncEngine.init` takes minutes to decode a state with tens of thousands of pending
+    /// changes (a 45 MB state kept an app from starting for 10+ minutes) and archiving it again
+    /// runs the app out of memory. Such a state is dropped and the upload queue is rebuilt from
+    /// the sync metadata, see `rebuildPendingChangesFromMetadata`. About 350 KB is normal.
+    package static let maxRestorableStateBytes = 16_000_000
+    package let needsPendingRebuild = LockIsolated(false)
+
+    private static func restoredState(
+      isPrivate: Bool,
+      metadatabase: any DatabaseReader,
+      syncEngine: SyncEngine
+    ) -> CKSyncEngine.State.Serialization? {
+      let scope: CKDatabase.Scope = isPrivate ? .private : .shared
+      let size =
+        (try? metadatabase.read { db in
+          try Int.fetchOne(
+            db,
+            sql: #"SELECT length("data") FROM "sqlitedata_icloud_stateSerialization" WHERE "scope" = ?"#,
+            arguments: [scope.rawValue]
+          )
+        }) ?? nil
+      if let size, size > maxRestorableStateBytes {
+        if isPrivate { syncEngine.needsPendingRebuild.withValue { $0 = true } }
+        return nil
+      }
+      return try? metadatabase.read { db in
+        if isPrivate {
+          try StateSerialization.find(#bind(.private)).select(\.data).fetchOne(db)
+        } else {
+          try StateSerialization.find(#bind(.shared)).select(\.data).fetchOne(db)
+        }
+      }
+    }
+
     package static let defaultMaxInMemoryPendingChanges = 1_000
     /// Per instance so tests can use a small bound (the mock server rejects batches of 200+).
     package let maxInMemoryPendingChanges = LockIsolated(SyncEngine.defaultMaxInMemoryPendingChanges)
@@ -201,24 +237,18 @@
             private: CKSyncEngine(
               CKSyncEngine.Configuration(
                 database: container.privateCloudDatabase,
-                stateSerialization: try? metadatabase.read { db in
-                  try StateSerialization
-                    .find(#bind(.private))
-                    .select(\.data)
-                    .fetchOne(db)
-                },
+                stateSerialization: Self.restoredState(
+                  isPrivate: true, metadatabase: metadatabase, syncEngine: syncEngine
+                ),
                 delegate: syncEngine
               )
             ),
             shared: CKSyncEngine(
               CKSyncEngine.Configuration(
                 database: container.sharedCloudDatabase,
-                stateSerialization: try? metadatabase.read { db in
-                  try StateSerialization
-                    .find(#bind(.shared))
-                    .select(\.data)
-                    .fetchOne(db)
-                },
+                stateSerialization: Self.restoredState(
+                  isPrivate: false, metadatabase: metadatabase, syncEngine: syncEngine
+                ),
                 delegate: syncEngine
               )
             )
@@ -653,6 +683,7 @@
     ) async throws {
       // A state saved by an older version (or by an import that outran the engine) can hold
       // far more pending changes than is safe to archive: park the excess in the table.
+      try await rebuildPendingChangesFromMetadata()
       try await spillExcessPendingChanges()
       let hasQueuedChanges = try await metadatabase.read { db in
         try PendingRecordZoneChange.count().fetchOne(db) ?? 0
@@ -803,6 +834,50 @@
           budget.isOverflowing = false
         }
       }
+    }
+
+    /// Rebuilds the upload queue after an oversized saved state was dropped: every record that has
+    /// no server copy yet needs a save, every tombstone with one needs a delete. Metadata rows
+    /// without a server record carry no blobs, so this is cheap except for the tombstone check.
+    private func rebuildPendingChangesFromMetadata() async throws {
+      guard needsPendingRebuild.value else { return }
+      try await userDatabase.write { db in try PendingRecordZoneChange.delete().execute(db) }
+      var lastRowID: Int64 = 0
+      var total = 0
+      while true {
+        let after = lastRowID
+        let page: [(rowID: Int64, change: CKSyncEngine.PendingRecordZoneChange)] =
+          try await metadatabase.read { db in
+            try Row.fetchAll(
+              db,
+              sql: """
+                SELECT rowid, "recordName", "zoneName", "ownerName", "_isDeleted"
+                FROM "sqlitedata_icloud_metadata"
+                WHERE rowid > ?
+                  AND ((NOT "hasLastKnownServerRecord" AND NOT "_isDeleted")
+                    OR ("_isDeleted" AND "hasLastKnownServerRecord"))
+                ORDER BY rowid LIMIT 2000
+                """,
+              arguments: [after]
+            ).map { row in
+              let id = CKRecord.ID(
+                recordName: row["recordName"],
+                zoneID: CKRecordZone.ID(zoneName: row["zoneName"], ownerName: row["ownerName"])
+              )
+              let isDeleted: Bool = row["_isDeleted"]
+              return (row["rowid"], isDeleted ? .deleteRecord(id) : .saveRecord(id))
+            }
+          }
+        guard let last = page.last else { break }
+        lastRowID = last.rowID
+        total += page.count
+        try await userDatabase.write { db in
+          try PendingRecordZoneChange
+            .insert { page.map { PendingRecordZoneChange($0.change) } }
+            .execute(db)
+        }
+      }
+      needsPendingRebuild.withValue { $0 = false }
     }
 
     /// Parks everything above the in-memory bound in the table. Done in one `remove` call so the
