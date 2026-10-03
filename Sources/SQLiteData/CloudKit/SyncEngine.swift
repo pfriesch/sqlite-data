@@ -44,6 +44,30 @@
     private let notificationsObserver = LockIsolated<(any NSObjectProtocol)?>(nil)
     private let activityCounts = LockIsolated(ActivityCounts())
     private let startTask = LockIsolated<Task<Void, Never>?>(nil)
+
+    /// The most record changes held in `CKSyncEngine`'s own state at once.
+    ///
+    /// `CKSyncEngine` archives its whole pending list on every state update, so memory use grows
+    /// with the number of pending changes (about 2 GB at 40k). Changes beyond this bound wait in
+    /// the `sqlitedata_icloud_pendingRecordZoneChanges` table and are moved into the engine as it
+    /// sends, see ``topUpPendingChanges()``.
+    package static let defaultMaxInMemoryPendingChanges = 1_000
+    /// Per instance so tests can use a small bound (the mock server rejects batches of 200+).
+    package let maxInMemoryPendingChanges = LockIsolated(SyncEngine.defaultMaxInMemoryPendingChanges)
+    private let pendingBudget = LockIsolated(PendingBudget())
+
+    private struct PendingBudget {
+      /// An upper estimate of the changes in the engines' state, re-measured on each top-up.
+      var inMemory = 0
+      /// While true new changes queue behind the ones already in the table, to keep their order.
+      var isOverflowing = false
+      /// Changes waiting to be inserted into the table (inserts are batched, not one per row).
+      var buffer: [CKSyncEngine.PendingRecordZoneChange] = []
+      var isFlushing = false
+      /// Top-ups run one at a time, or two would each see the same room and exceed the bound.
+      var isToppingUp = false
+      var topUpRequested = false
+    }
     #if DEBUG && canImport(DeveloperToolsSupport)
       private let previewTimerTask = LockIsolated<Task<Void, Never>?>(nil)
     #endif
@@ -627,10 +651,14 @@
       previousRecordTypeByTableName: [String: RecordType],
       currentRecordTypeByTableName: [String: RecordType]
     ) async throws {
-      try await enqueueLocallyPendingChanges()
+      // A state saved by an older version (or by an import that outran the engine) can hold
+      // far more pending changes than is safe to archive: park the excess in the table.
+      try await spillExcessPendingChanges()
+      let hasQueuedChanges = try await metadatabase.read { db in
+        try PendingRecordZoneChange.count().fetchOne(db) ?? 0
+      } > 0
+      pendingBudget.withValue { $0.isOverflowing = hasQueuedChanges }
       try await userDatabase.write { db in
-        try PendingRecordZoneChange.delete().execute(db)
-
         let newTableNames = currentRecordTypeByTableName.keys.filter { tableName in
           previousRecordTypeByTableName[tableName] == nil
         }
@@ -641,25 +669,159 @@
           }
         }
       }
+      await topUpPendingChanges()
     }
 
-    private func enqueueLocallyPendingChanges() async throws {
-      let pendingRecordZoneChanges = try await metadatabase.read { db in
-        try PendingRecordZoneChange
-          .select(\.pendingRecordZoneChange)
-          .fetchAll(db)
+    // MARK: Bounded pending changes
+
+    /// Routes new changes to the engine while it has room, to the table once it is full.
+    private func enqueue(_ changes: [CKSyncEngine.PendingRecordZoneChange]) {
+      guard !changes.isEmpty else { return }
+      let goesToTable = pendingBudget.withValue { budget -> Bool in
+        if budget.isOverflowing
+          || budget.inMemory + changes.count > maxInMemoryPendingChanges.value
+        {
+          budget.isOverflowing = true
+          budget.buffer.append(contentsOf: changes)
+          return true
+        }
+        budget.inMemory += changes.count
+        return false
       }
-      let changesByIsPrivate = Dictionary(grouping: pendingRecordZoneChanges) {
+      if goesToTable {
+        scheduleOverflowFlush()
+      } else {
+        addToEngines(changes)
+      }
+    }
+
+    private func addToEngines(_ changes: [CKSyncEngine.PendingRecordZoneChange]) {
+      let isPrivate: (CKSyncEngine.PendingRecordZoneChange) -> Bool = {
         switch $0 {
         case .deleteRecord(let recordID), .saveRecord(let recordID):
-          recordID.zoneID.ownerName == CKCurrentUserDefaultName
+          return recordID.zoneID.ownerName == CKCurrentUserDefaultName
         @unknown default:
-          false
+          return false
         }
       }
+      let privateChanges = changes.filter(isPrivate)
+      let sharedChanges = changes.filter { !isPrivate($0) }
       syncEngines.withValue {
-        $0.private?.state.add(pendingRecordZoneChanges: changesByIsPrivate[true] ?? [])
-        $0.shared?.state.add(pendingRecordZoneChanges: changesByIsPrivate[false] ?? [])
+        if !privateChanges.isEmpty { $0.private?.state.add(pendingRecordZoneChanges: privateChanges) }
+        if !sharedChanges.isEmpty { $0.shared?.state.add(pendingRecordZoneChanges: sharedChanges) }
+      }
+    }
+
+    private func scheduleOverflowFlush() {
+      let shouldStart = pendingBudget.withValue { budget -> Bool in
+        guard !budget.isFlushing else { return false }
+        budget.isFlushing = true
+        return true
+      }
+      guard shouldStart else { return }
+      // Runs outside the write that fired the trigger, which is still open here.
+      Task { await flushOverflowBuffer() }
+    }
+
+    private func flushOverflowBuffer() async {
+      while true {
+        let batch = pendingBudget.withValue { budget -> [CKSyncEngine.PendingRecordZoneChange] in
+          let batch = Array(budget.buffer.prefix(2_000))
+          budget.buffer.removeFirst(batch.count)
+          if batch.isEmpty { budget.isFlushing = false }
+          return batch
+        }
+        guard !batch.isEmpty else { break }
+        await withErrorReporting(.sqliteDataCloudKitFailure) {
+          try await userDatabase.write { db in
+            try PendingRecordZoneChange
+              .insert { batch.map { PendingRecordZoneChange($0) } }
+              .execute(db)
+          }
+        }
+      }
+      await topUpPendingChanges()
+    }
+
+    /// Moves queued changes from the table into the engines, up to the in-memory bound.
+    ///
+    /// Called after every batch the engine sends, so the engine always has work and never more
+    /// than `maxInMemoryPendingChanges`.
+    package func topUpPendingChanges() async {
+      let shouldRun = pendingBudget.withValue { budget -> Bool in
+        if budget.isToppingUp {
+          budget.topUpRequested = true
+          return false
+        }
+        budget.isToppingUp = true
+        return true
+      }
+      guard shouldRun else { return }
+      repeat {
+        pendingBudget.withValue { $0.topUpRequested = false }
+        await topUpOnce()
+      } while pendingBudget.withValue({ budget -> Bool in
+        if budget.topUpRequested { return true }
+        budget.isToppingUp = false
+        return false
+      })
+    }
+
+    private func topUpOnce() async {
+      guard isRunning else { return }
+      let inMemory = syncEngines.withValue {
+        ($0.private?.state.pendingRecordZoneChanges.count ?? 0)
+          + ($0.shared?.state.pendingRecordZoneChanges.count ?? 0)
+      }
+      let room = max(maxInMemoryPendingChanges.value - inMemory, 0)
+      guard room > 0 else { return }
+      let changes: [CKSyncEngine.PendingRecordZoneChange] =
+        await withErrorReporting(.sqliteDataCloudKitFailure) {
+          try await userDatabase.write { db in
+            let changes = try PendingRecordZoneChange
+              .limit(room)
+              .select(\.pendingRecordZoneChange)
+              .fetchAll(db)
+            guard !changes.isEmpty else { return [] }
+            try #sql(
+              """
+              DELETE FROM "sqlitedata_icloud_pendingRecordZoneChanges"
+              WHERE rowid IN (
+                SELECT rowid FROM "sqlitedata_icloud_pendingRecordZoneChanges"
+                ORDER BY rowid LIMIT \(raw: String(changes.count))
+              )
+              """
+            )
+            .execute(db)
+            return changes
+          }
+        } ?? []
+      addToEngines(changes)
+      pendingBudget.withValue { budget in
+        budget.inMemory = inMemory + changes.count
+        if changes.count < room && budget.buffer.isEmpty && !budget.isFlushing {
+          budget.isOverflowing = false
+        }
+      }
+    }
+
+    /// Parks everything above the in-memory bound in the table. Done in one `remove` call so the
+    /// state shrinks before `CKSyncEngine` archives it again.
+    private func spillExcessPendingChanges() async throws {
+      let engines = syncEngines.withValue { [$0.private, $0.shared] }.compactMap { $0 }
+      for engine in engines {
+        let pending = engine.state.pendingRecordZoneChanges
+        guard pending.count > maxInMemoryPendingChanges.value else { continue }
+        let excess = Array(pending.dropFirst(maxInMemoryPendingChanges.value))
+        for start in stride(from: 0, to: excess.count, by: 2_000) {
+          let chunk = excess[start..<min(start + 2_000, excess.count)]
+          try await userDatabase.write { db in
+            try PendingRecordZoneChange
+              .insert { chunk.map { PendingRecordZoneChange($0) } }
+              .execute(db)
+          }
+        }
+        engine.state.remove(pendingRecordZoneChanges: excess)
       }
     }
 
@@ -838,14 +1000,7 @@
         }
         return
       }
-      let oldSyncEngine = self.syncEngines.withValue {
-        oldZoneID.ownerName == CKCurrentUserDefaultName ? $0.private : $0.shared
-      }
-      let syncEngine = self.syncEngines.withValue {
-        zoneID.ownerName == CKCurrentUserDefaultName ? $0.private : $0.shared
-      }
-      oldSyncEngine?.state.add(pendingRecordZoneChanges: oldChanges)
-      syncEngine?.state.add(pendingRecordZoneChanges: newChanges)
+      enqueue(oldChanges + newChanges)
     }
 
     @DatabaseFunction(
@@ -879,10 +1034,7 @@
         return
       }
 
-      let syncEngine = self.syncEngines.withValue {
-        zoneID.ownerName == CKCurrentUserDefaultName ? $0.private : $0.shared
-      }
-      syncEngine?.state.add(pendingRecordZoneChanges: changes)
+      enqueue(changes)
     }
 
     package func acceptShare(metadata: ShareMetadata) async throws {
@@ -1034,6 +1186,7 @@
           failedRecordDeletes: failedRecordDeletes,
           syncEngine: syncEngine
         )
+        await topUpPendingChanges()
 
       case .willFetchRecordZoneChanges:
         await MainActor.run {
