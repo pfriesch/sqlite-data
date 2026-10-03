@@ -92,19 +92,6 @@
     package let maxInMemoryPendingChanges = LockIsolated(SyncEngine.defaultMaxInMemoryPendingChanges)
     private let pendingBudget = LockIsolated(PendingBudget())
 
-    /// How long a send cycle may end with changes still pending before the engine is told to send
-    /// again.
-    ///
-    /// `CKSyncEngine` ends its send cycle after a batch with failures (for example 250 times
-    /// `serverRecordChanged`) and does not start another one by itself, even though the library
-    /// has re-queued the failed records: measured on a device, 1,000 changes sat pending for
-    /// 8+ minutes until the app was relaunched. Calling `sendChanges()` or `fetchChanges()` on
-    /// that engine instance does nothing (an empty cycle); only a new engine built from the saved
-    /// state sends again. See `armSendWatchdog(syncEngine:)`.
-    package let sendWatchdogDelay = LockIsolated(Duration.seconds(5))
-    private let sendWatchdog = LockIsolated<Task<Void, Never>?>(nil)
-    private let idleKicks = LockIsolated(0)
-
     private struct PendingBudget {
       /// An upper estimate of the changes in the engines' state, re-measured on each top-up.
       var inMemory = 0
@@ -849,52 +836,6 @@
       }
     }
 
-    /// Restarts sending when a send cycle ended with changes still pending and nothing started
-    /// another one: first a plain `sendChanges()`, then (from the second kick) a stop and start of
-    /// the engine. The delay doubles (up to 64x) for each kick that does not lead to a successful
-    /// send, and resets as soon as one does.
-    package func armSendWatchdog(syncEngine: any SyncEngineProtocol) {
-      let delay = sendWatchdogDelay.value * (1 << min(idleKicks.value, 6))
-      // Detached: a task created inside a delegate callback inherits CloudKit's "in a callback"
-      // task-local, and CKSyncEngine then traps ("Cannot await a call into CKSyncEngine from
-      // within a delegate callback") when this task calls `sendChanges`.
-      let task = Task.detached { [weak self] in
-        try? await Task.sleep(for: delay)
-        guard let self, !Task.isCancelled else { return }
-        await self.kickSendIfIdle(syncEngine: syncEngine)
-      }
-      sendWatchdog.withValue {
-        $0?.cancel()
-        $0 = task
-      }
-    }
-
-    private func kickSendIfIdle(syncEngine: any SyncEngineProtocol) async {
-      guard isRunning, !syncEngine.state.pendingRecordZoneChanges.isEmpty
-      else { return }
-      let isSending = await MainActor.run { sendingChangesCount > 0 }
-      guard !isSending else { return }
-      let kick = idleKicks.withValue { value -> Int in
-        value += 1
-        return value
-      }
-      if kick >= 2 {
-        // Asking the stuck engine to send does nothing; a fresh engine built from the saved state
-        // (what a relaunch does) sends at once.
-        stop()
-        await withErrorReporting(.sqliteDataCloudKitFailure) { try await start() }
-        if let engine = syncEngines.withValue({ $0.private }) { armSendWatchdog(syncEngine: engine) }
-        return
-      }
-      await withErrorReporting(.sqliteDataCloudKitFailure) {
-        try await syncEngine.sendChanges(CKSyncEngine.SendChangesOptions())
-      }
-      // If that produced no send cycle (so no `didSendChanges`), check again later.
-      if !Task.isCancelled, !syncEngine.state.pendingRecordZoneChanges.isEmpty {
-        armSendWatchdog(syncEngine: syncEngine)
-      }
-    }
-
     /// Rebuilds the upload queue after an oversized saved state was dropped: every record that has
     /// no server copy yet needs a save, every tombstone with one needs a delete. Metadata rows
     /// without a server record carry no blobs, so this is cheap except for the tombstone check.
@@ -1321,9 +1262,6 @@
           syncEngine: syncEngine
         )
         await topUpPendingChanges()
-        if !savedRecords.isEmpty || !deletedRecordIDs.isEmpty {
-          idleKicks.setValue(0)
-        }
 
       case .willFetchRecordZoneChanges:
         await MainActor.run {
@@ -1344,7 +1282,6 @@
         }
 
       case .willSendChanges:
-        sendWatchdog.withValue { $0?.cancel() }
         await MainActor.run {
           sendingChangesCount += 1
         }
@@ -1352,7 +1289,6 @@
         await MainActor.run {
           sendingChangesCount -= 1
         }
-        armSendWatchdog(syncEngine: syncEngine)
 
       @unknown default:
         break
