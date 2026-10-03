@@ -542,6 +542,41 @@
       return inEngines + buffered + (inTable ?? 0)
     }
 
+    /// Opt-in, off by default: after CloudKit refuses a send because of load, send again once the
+    /// server's retry-after has passed.
+    ///
+    /// Without this, `CKSyncEngine` follows Apple's documented behavior: it hands the retry to the
+    /// system's activity scheduler, which in our measurements (docs/cloudkit-sync-engine.md) stayed
+    /// silent for 12+ minutes while the server's wait was 25 seconds. Turning this on calls
+    /// `CKSyncEngine.sendChanges()` after the wait (the same call a user-initiated "sync now" makes),
+    /// so uploads continue sooner. The cost: more requests while CloudKit is asking for fewer, so
+    /// repeated throttles (each with a fresh retry-after) are possible, and the system's own
+    /// scheduling (battery, network conditions) is bypassed. A later throttle simply schedules the
+    /// next attempt.
+    public var resumesSendingAfterThrottle: Bool {
+      get { _resumesSendingAfterThrottle.withValue(\.self) }
+      set { _resumesSendingAfterThrottle.withValue { $0 = newValue } }
+    }
+    private let _resumesSendingAfterThrottle = LockIsolated(false)
+    private let resumeAfterThrottleTask = LockIsolated<Task<Void, Never>?>(nil)
+
+    private func scheduleResumeAfterThrottle(retryAfterSeconds: Double?) {
+      guard resumesSendingAfterThrottle else { return }
+      // At least 5 s, a little jitter so devices do not retry in lockstep.
+      let delay = max(retryAfterSeconds ?? 30, 5) + Double.random(in: 0...5)
+      resumeAfterThrottleTask.withValue {
+        $0?.cancel()
+        // Detached: awaiting a CKSyncEngine call from a task created inside a delegate callback traps.
+        $0 = Task.detached { [weak self] in
+          try? await Task.sleep(for: .seconds(delay))
+          guard !Task.isCancelled, let self,
+            let engine = self.syncEngines.withValue({ $0.private }) as? CKSyncEngine
+          else { return }
+          try? await engine.sendChanges()
+        }
+      }
+    }
+
     private func recordSendOutcome(
       saved: Int,
       failedSaves: [(record: CKRecord, error: CKError)],
@@ -557,6 +592,9 @@
       )
       observationRegistrar.withMutation(of: self, keyPath: \.lastSendOutcome) {
         _lastSendOutcome.withValue { $0 = outcome }
+      }
+      if outcome.isThrottled {
+        scheduleResumeAfterThrottle(retryAfterSeconds: outcome.retryAfterSeconds)
       }
     }
 
