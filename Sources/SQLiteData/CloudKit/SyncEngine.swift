@@ -92,6 +92,23 @@
     package let maxInMemoryPendingChanges = LockIsolated(SyncEngine.defaultMaxInMemoryPendingChanges)
     private let pendingBudget = LockIsolated(PendingBudget())
 
+    /// Changes to add to the engine once the current send operation has ended.
+    ///
+    /// `CKSyncEngine` does not start another send when changes are added from inside a
+    /// `sentRecordZoneChanges` callback: after a batch with failures (for example 250 times
+    /// `serverRecordChanged`) the engine ended its send operation and stayed idle with the
+    /// re-queued changes pending, for minutes, until the app was relaunched. Adding the same
+    /// changes after the operation has ended makes the engine fetch and send again within a
+    /// second. This matches an Apple Developer Forums report and the documented rule that adding
+    /// changes only schedules a sync if none is scheduled. See docs/cloudkit-sync-backlog.md.
+    private let changesToAddAfterSend = LockIsolated(DeferredChanges())
+
+    private struct DeferredChanges {
+      var database: [CKSyncEngine.PendingDatabaseChange] = []
+      var records: [CKSyncEngine.PendingRecordZoneChange] = []
+      var isEmpty: Bool { database.isEmpty && records.isEmpty }
+    }
+
     private struct PendingBudget {
       /// An upper estimate of the changes in the engines' state, re-measured on each top-up.
       var inMemory = 0
@@ -774,6 +791,24 @@
       await topUpPendingChanges()
     }
 
+    /// Adds the changes held back by `handleSentRecordZoneChanges`, then tops the engine up from the
+    /// table, from a task that runs after the send operation has ended.
+    ///
+    /// Detached on purpose: a task created inside a delegate callback inherits CloudKit's "in a
+    /// callback" context.
+    private func addDeferredChangesAfterSend(syncEngine: any SyncEngineProtocol) {
+      let changes = changesToAddAfterSend.withValue { deferred -> DeferredChanges in
+        defer { deferred = DeferredChanges() }
+        return deferred
+      }
+      Task.detached { [weak self] in
+        try? await Task.sleep(for: .milliseconds(100))
+        syncEngine.state.add(pendingDatabaseChanges: changes.database)
+        syncEngine.state.add(pendingRecordZoneChanges: changes.records)
+        await self?.topUpPendingChanges()
+      }
+    }
+
     /// Moves queued changes from the table into the engines, up to the in-memory bound.
     ///
     /// Called after every batch the engine sends, so the engine always has work and never more
@@ -1289,6 +1324,7 @@
         await MainActor.run {
           sendingChangesCount -= 1
         }
+        addDeferredChangesAfterSend(syncEngine: syncEngine)
 
       @unknown default:
         break
@@ -1896,8 +1932,17 @@
       var newPendingRecordZoneChanges: [CKSyncEngine.PendingRecordZoneChange] = []
       var newPendingDatabaseChanges: [CKSyncEngine.PendingDatabaseChange] = []
       defer {
-        syncEngine.state.add(pendingDatabaseChanges: newPendingDatabaseChanges)
-        syncEngine.state.add(pendingRecordZoneChanges: newPendingRecordZoneChanges)
+        if syncEngine is CKSyncEngine {
+          let database = newPendingDatabaseChanges
+          let records = newPendingRecordZoneChanges
+          changesToAddAfterSend.withValue {
+            $0.database += database
+            $0.records += records
+          }
+        } else {
+          syncEngine.state.add(pendingDatabaseChanges: newPendingDatabaseChanges)
+          syncEngine.state.add(pendingRecordZoneChanges: newPendingRecordZoneChanges)
+        }
       }
       for (failedRecord, error) in failedRecordSaves {
         func clearServerRecord() async {
