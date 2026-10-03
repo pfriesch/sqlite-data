@@ -48,6 +48,25 @@
       }
 
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func aSendCycleThatEndsWithPendingChangesIsRestarted() async throws {
+        syncEngine.sendWatchdogDelay.setValue(.milliseconds(100))
+        try await userDatabase.userWrite { db in
+          try db.seed {
+            RemindersList(id: 1, title: "Personal")
+            Reminder(id: 1, title: "Get milk", remindersListID: 1)
+          }
+        }
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(!syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
+
+        // CKSyncEngine ended its cycle (e.g. after a failed batch) and sends nothing by itself.
+        syncEngine.armSendWatchdog(syncEngine: syncEngine.private)
+        try await Task.sleep(for: .seconds(1))
+
+        #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test func anOversizedStateIsSpilledToTheTableOnStart() async throws {
         let bound = 100
         syncEngine.maxInMemoryPendingChanges.setValue(bound)
