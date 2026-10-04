@@ -30,8 +30,8 @@
       case willFetchRecordZoneChanges(zoneID: CKRecordZone.ID)
       case didFetchChanges
       case didFetchRecordZoneChanges(zoneID: CKRecordZone.ID, error: CKError?)
-      case willSendChanges(context: CKSyncEngine.SendChangesContext)
-      case didSendChanges(context: CKSyncEngine.SendChangesContext)
+      case willSendChanges
+      case didSendChanges
 
       init?(_ event: CKSyncEngine.Event) {
         switch event {
@@ -73,10 +73,10 @@
           self = .didFetchChanges
         case .didFetchRecordZoneChanges(let event):
           self = .didFetchRecordZoneChanges(zoneID: event.zoneID, error: event.error)
-        case .willSendChanges(let event):
-          self = .willSendChanges(context: event.context)
-        case .didSendChanges(let event):
-          self = .didSendChanges(context: event.context)
+        case .willSendChanges:
+          self = .willSendChanges
+        case .didSendChanges:
+          self = .didSendChanges
         @unknown default:
           return nil
         }

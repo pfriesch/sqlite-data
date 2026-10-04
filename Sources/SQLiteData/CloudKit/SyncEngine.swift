@@ -570,9 +570,9 @@
         $0 = Task.detached { [weak self] in
           try? await Task.sleep(for: .seconds(delay))
           guard !Task.isCancelled, let self,
-            let engine = self.syncEngines.withValue({ $0.private }) as? CKSyncEngine
+            let engine = self.syncEngines.withValue({ $0.private })
           else { return }
-          try? await engine.sendChanges()
+          try? await engine.sendChanges(CKSyncEngine.SendChangesOptions())
         }
       }
     }
@@ -1502,19 +1502,30 @@
         }
       #endif
 
+      // NB: One read for the metadata and one per table for the rows of the first batch, instead of
+      //     two reads per record; one write at the end instead of one per record.
+      let prefetch = await prefetchBatchInputs(
+        for: changes.prefix(Self.maxBatchRecords).compactMap {
+          guard case .saveRecord(let recordID) = $0 else { return nil }
+          return recordID
+        }
+      )
+      let refreshedRecords = LockIsolated<[CKRecord]>([])
       let batch = await syncEngine.recordZoneChangeBatch(pendingChanges: changes) { recordID in
         guard
-          let (metadata, allFields) = await withErrorReporting(
-            .sqliteDataCloudKitFailure,
-            catching: {
-              try await metadatabase.read { db in
-                try SyncMetadata
-                  .find(recordID)
-                  .select { ($0, $0._lastKnownServerRecordAllFields) }
-                  .fetchOne(db)
+          let (metadata, allFields) = prefetch.covered.contains(recordID)
+            ? prefetch.metadata[recordID]
+            : await withErrorReporting(
+              .sqliteDataCloudKitFailure,
+              catching: {
+                try await metadatabase.read { db in
+                  try SyncMetadata
+                    .find(recordID)
+                    .select { ($0, $0._lastKnownServerRecordAllFields) }
+                    .fetchOne(db)
+                }
               }
-            }
-          )
+            )
             ?? nil
         else {
           syncEngine.state.remove(pendingRecordZoneChanges: [.saveRecord(recordID)])
@@ -1553,8 +1564,11 @@
           return nil
         }
         func open<T>(_: some SynchronizableTable<T>) async -> CKRecord? {
-          let row =
-            await withErrorReporting(.sqliteDataCloudKitFailure) {
+          let row: T.QueryOutput? =
+            prefetch.covered.contains(recordID)
+            ? prefetch.rows["\(metadata.recordType)\u{0}\(metadata.recordPrimaryKey)"]
+              as? T.QueryOutput
+            : await withErrorReporting(.sqliteDataCloudKitFailure) {
               // NB: Fake 'sending' result.
               nonisolated(unsafe) var result: T.QueryOutput?
               try await userDatabase.read { db in
@@ -1600,13 +1614,71 @@
             with: T(queryOutput: row),
             userModificationTime: metadata.userModificationTime
           )
-          await refreshLastKnownServerRecord(record)
+          refreshedRecords.withValue { $0.append(record) }
           sentRecord = recordID
           return record
         }
         return await open(table)
       }
+      await refreshLastKnownServerRecords(refreshedRecords.withValue(\.self))
       return batch
+    }
+
+    /// The most records in one `CKSyncEngine` batch.
+    package static let maxBatchRecords = 250
+
+    private struct BatchPrefetch: @unchecked Sendable {
+      var covered: Set<CKRecord.ID> = []
+      var metadata: [CKRecord.ID: (SyncMetadata, CKRecord?)] = [:]
+      var rows: [String: Any] = [:]
+    }
+
+    private func prefetchBatchInputs(for recordIDs: [CKRecord.ID]) async -> BatchPrefetch {
+      guard !recordIDs.isEmpty else { return BatchPrefetch() }
+      let rows: [(SyncMetadata, CKRecord?)] =
+        await withErrorReporting(.sqliteDataCloudKitFailure) {
+          try await metadatabase.read { db in
+            try SyncMetadata
+              .findAll(recordIDs)
+              .select { ($0, $0._lastKnownServerRecordAllFields) }
+              .fetchAll(db)
+          }
+        } ?? []
+      var prefetch = BatchPrefetch()
+      for (metadata, allFields) in rows {
+        let recordID = CKRecord.ID(
+          recordName: metadata.recordName,
+          zoneID: CKRecordZone.ID(zoneName: metadata.zoneName, ownerName: metadata.ownerName)
+        )
+        prefetch.metadata[recordID] = (metadata, allFields)
+      }
+      let primaryKeysByTable = Dictionary(
+        grouping: prefetch.metadata.values.map(\.0),
+        by: \.recordType
+      )
+      .mapValues { $0.map(\.recordPrimaryKey) }
+      for (recordType, primaryKeys) in primaryKeysByTable {
+        guard let table = tablesByName[recordType] else { continue }
+        func open<T>(_: some SynchronizableTable<T>) async {
+          // NB: Same as the per-record read: 'T.QueryOutput' is not 'Sendable'.
+          nonisolated(unsafe) var fetched: [T.QueryOutput] = []
+          await withErrorReporting(.sqliteDataCloudKitFailure) {
+            try await userDatabase.read { db in
+              fetched = try T.unscoped
+                .where { #sql("\($0.primaryKey)").in(primaryKeys) }
+                .fetchAll(db)
+            }
+          }
+          for row in fetched {
+            let key = T(queryOutput: row).syncMetadataID.recordPrimaryKey
+            prefetch.rows["\(recordType)\u{0}\(key)"] = row
+          }
+        }
+        await open(table)
+      }
+      // NB: Anything the prefetch could not see falls back to the per-record reads.
+      prefetch.covered = Set(recordIDs)
+      return prefetch
     }
 
     private func pendingRecordZoneChanges(
@@ -2033,14 +2105,12 @@
       failedRecordDeletes: [CKRecord.ID: CKError] = [:],
       syncEngine: any SyncEngineProtocol
     ) async {
-      for savedRecord in savedRecords {
-        await refreshLastKnownServerRecord(savedRecord)
-      }
+      await refreshLastKnownServerRecords(savedRecords)
 
       var newPendingRecordZoneChanges: [CKSyncEngine.PendingRecordZoneChange] = []
       var newPendingDatabaseChanges: [CKSyncEngine.PendingDatabaseChange] = []
       defer {
-        if syncEngine is CKSyncEngine {
+        if (syncEngine as? MockSyncEngine)?.state.isRealistic.value ?? true {
           let database = newPendingDatabaseChanges
           let records = newPendingRecordZoneChanges
           changesToAddAfterSend.withValue {
@@ -2381,23 +2451,26 @@
       }
     }
 
-    private func refreshLastKnownServerRecord(_ record: CKRecord) async {
+    private func refreshLastKnownServerRecords(_ records: [CKRecord]) async {
+      guard !records.isEmpty else { return }
       await withErrorReporting(.sqliteDataCloudKitFailure) {
         try await userDatabase.write { db in
-          let metadata = try SyncMetadata.find(record.recordID).fetchOne(db)
-          func updateLastKnownServerRecord() throws {
-            try SyncMetadata
-              .find(record.recordID)
-              .update { $0.setLastKnownServerRecord(record) }
-              .execute(db)
-          }
+          for record in records {
+            let metadata = try SyncMetadata.find(record.recordID).fetchOne(db)
+            func updateLastKnownServerRecord() throws {
+              try SyncMetadata
+                .find(record.recordID)
+                .update { $0.setLastKnownServerRecord(record) }
+                .execute(db)
+            }
 
-          if let lastKnownDate = metadata?.lastKnownServerRecord?.modificationDate {
-            if let recordDate = record.modificationDate, lastKnownDate < recordDate {
+            if let lastKnownDate = metadata?.lastKnownServerRecord?.modificationDate {
+              if let recordDate = record.modificationDate, lastKnownDate < recordDate {
+                try updateLastKnownServerRecord()
+              }
+            } else {
               try updateLastKnownServerRecord()
             }
-          } else {
-            try updateLastKnownServerRecord()
           }
         }
       }

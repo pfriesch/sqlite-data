@@ -44,6 +44,21 @@
       _container.value!
     }
 
+    /// What the server accepts in one request; larger requests fail with `limitExceeded`.
+    package static let maxItemsPerRequest = 400
+    package static let maxBytesPerRequest = 2_000_000
+
+    private let injectedErrors = LockIsolated<[CKError]>([])
+
+    /// Makes the next `count` `modifyRecords` requests fail as a whole with `error`.
+    package func failNextRequests(_ count: Int = 1, with error: CKError) {
+      injectedErrors.withValue { $0 += Array(repeating: error, count: count) }
+    }
+
+    private func nextInjectedError() -> CKError? {
+      injectedErrors.withValue { $0.isEmpty ? nil : $0.removeFirst() }
+    }
+
     package func record(for recordID: CKRecord.ID) throws -> CKRecord {
       let accountStatus = container.accountStatus()
       guard accountStatus == .available
@@ -79,7 +94,7 @@
       guard accountStatus == .available
       else { throw ckError(forAccountStatus: accountStatus) }
 
-      guard ids.count < 200
+      guard ids.count <= Self.maxItemsPerRequest
       else { throw CKError(.limitExceeded) }
 
       var results: [CKRecord.ID: Result<CKRecord, any Error>] = [:]
@@ -102,7 +117,11 @@
       guard accountStatus == .available
       else { throw ckError(forAccountStatus: accountStatus) }
 
-      guard (recordsToSave.count + recordIDsToDelete.count) < 200
+      if let error = nextInjectedError() { throw error }
+
+      guard
+        (recordsToSave.count + recordIDsToDelete.count) <= Self.maxItemsPerRequest,
+        recordsToSave.reduce(0, { $0 + $1.estimatedByteCount }) <= Self.maxBytesPerRequest
       else {
         throw CKError(.limitExceeded)
       }
@@ -412,6 +431,38 @@
       fatalError()
     @unknown default:
       fatalError()
+    }
+  }
+
+  @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+  extension CKError {
+    /// A throttle refusal as CloudKit sends it: `serviceUnavailable` with a retry-after.
+    package static func throttled(retryAfter seconds: Double = 30) -> CKError {
+      CKError(.serviceUnavailable, userInfo: [CKErrorRetryAfterKey: seconds])
+    }
+
+    /// Errors that fail a whole request (every record in it) rather than one record.
+    var isRequestRefusal: Bool {
+      switch code {
+      case .serviceUnavailable, .requestRateLimited, .zoneBusy, .networkFailure,
+        .networkUnavailable, .limitExceeded:
+        true
+      default:
+        false
+      }
+    }
+  }
+
+  extension CKRecord {
+    /// Rough size of the record data a request carries; enough to trip the 2 MB limit.
+    fileprivate var estimatedByteCount: Int {
+      allKeys().reduce(recordID.recordName.utf8.count) { total, key in
+        switch self[key] {
+        case let value as String: total + value.utf8.count
+        case let value as Data: total + value.count
+        default: total + 8
+        }
+      }
     }
   }
 #endif

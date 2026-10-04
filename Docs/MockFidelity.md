@@ -37,6 +37,16 @@ Keep the existing hand-driven API (existing tests keep working) and add an **opt
 6. **Clock and rate limit (fix 11), optional.** Inject a `Clock` (swift-dependencies `continuousClock`, already used elsewhere) and a token bucket in the database (about 1,200 records/min, burst 750-1,750) that fails with `serviceUnavailable` + retry-after when drained. Lets pacing/backoff logic be tested without sleeping.
 7. **Cheap fidelity fixes that need no new machinery:** make `savePolicy` explicit and support `.allKeys`/`.changedKeys` instead of `fatalError()`; implement the `TODO` (merge changed fields on save); give `_recordChangeTag` a per-zone counter; make `cancelOperations` clear in-flight work; keep `OrderedSet` dedup and document that real state also dedups (**[assumed]**, verify).
 
+## Status (2026-10-04)
+
+Done, tested in `RealisticMockTests`: steps 1-4 of the design, in part.
+- Cycle: `SyncEngine.runSendCycle(scope:)` posts `willSendChanges`/`didSendChanges` around batches; ends at the first failed batch. Opt-in via `MockSyncEngine.state.isRealistic`; `sendChanges()` runs it when on.
+- Limits: 250 records per batch, 400 items / 2 MB per request (`limitExceeded`), always on.
+- Scheduling: `isSendScheduled` is set only by changes added outside a cycle; `runScheduledSend(scope:)` runs it. The `f0e8fb5` regression test fails when the deferral is reverted (checked).
+- Injection: `database.failNextRequests(_:with:)`, `CKError.throttled(retryAfter:)`; a refused request fails every record, which stays pending, and the engine waits until `advanceScheduler()` or a manual `sendChanges()`.
+- Mock no longer removes saves from pending when it builds a batch (deviation 6, partly).
+- Not done: `stateUpdate` events with a serialization (items 1 and 8), in-flight tracking, a test for `resumesSendingAfterThrottle` (its minimum delay is 5 s of real time), steps 5-7.
+
 ## Order of work and risk
 
 1. Events + cycle (1) and batch/limit constants (2): mechanical, no behavior change for old tests when the realistic mode is off. Enables testing `isSendingChanges`, the deferral and the bound with real sizes.

@@ -83,7 +83,22 @@
       )
     }
 
+    /// Lets the system scheduler fire after a transient refusal, scheduling a send if work is left.
+    package func advanceScheduler() {
+      state.isSchedulerWaiting.setValue(false)
+      if !state.pendingRecordZoneChanges.isEmpty { state.isSendScheduled.setValue(true) }
+    }
+
     package func sendChanges(_ options: CKSyncEngine.SendChangesOptions) async throws {
+      if state.isRealistic.value {
+        // A user-initiated send bypasses the scheduler.
+        state.isSchedulerWaiting.setValue(false)
+        if !state.pendingDatabaseChanges.isEmpty {
+          try await parentSyncEngine.processPendingDatabaseChanges(scope: database.databaseScope)
+        }
+        try await parentSyncEngine.runSendCycle(scope: database.databaseScope)
+        return
+      }
 
       if !parentSyncEngine.syncEngine(for: database.databaseScope).state.pendingDatabaseChanges
         .isEmpty
@@ -106,7 +121,7 @@
       var recordsToSave: [CKRecord] = []
       var recordIDsSkipped: [CKRecord.ID] = []
       var recordIDsToDelete: [CKRecord.ID] = []
-      for pendingChange in pendingChanges {
+      for pendingChange in pendingChanges.prefix(SyncEngine.maxBatchRecords) {
         switch pendingChange {
         case .saveRecord(let recordID):
           guard let record = await recordProvider(recordID)
@@ -122,8 +137,6 @@
         }
       }
 
-      state.remove(pendingRecordZoneChanges: recordsToSave.map { .saveRecord($0.recordID) })
-
       return CKSyncEngine.RecordZoneChangeBatch(
         recordsToSave: recordsToSave,
         recordIDsToDelete: recordIDsToDelete
@@ -137,6 +150,18 @@
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   package final class MockSyncEngineState: CKSyncEngineStateProtocol {
     package let changeTag = LockIsolated(0)
+    /// Opt-in: behave like `CKSyncEngine` about when work happens. Failed changes are re-queued
+    /// after `didSendChanges`, `sendChanges()` runs a whole cycle with `willSendChanges`/
+    /// `didSendChanges`, and a send is only scheduled by changes added outside a cycle. Off by
+    /// default so tests that drive one batch by hand keep working.
+    package let isRealistic = LockIsolated(false)
+    package let isSendCycleRunning = LockIsolated(false)
+    /// Set when changes are added outside a send cycle (the real engine then schedules a send);
+    /// consumed by ``SyncEngine/runScheduledSend(scope:)``.
+    package let isSendScheduled = LockIsolated(false)
+    /// Set after a send cycle ended on a transient refusal: the real engine hands the retry to the
+    /// system scheduler and sends nothing until then. Cleared by ``MockSyncEngine/advanceScheduler()``.
+    package let isSchedulerWaiting = LockIsolated(false)
     package let _pendingRecordZoneChanges = LockIsolated<
       OrderedSet<CKSyncEngine.PendingRecordZoneChange>
     >([]
@@ -178,6 +203,10 @@
       self._pendingRecordZoneChanges.withValue {
         $0.append(contentsOf: pendingRecordZoneChanges)
       }
+      // NB: Changes added while a cycle runs do not schedule another send (measured on device).
+      if !pendingRecordZoneChanges.isEmpty, !isSendCycleRunning.value, !isSchedulerWaiting.value {
+        isSendScheduled.setValue(true)
+      }
     }
 
     package func remove(pendingRecordZoneChanges: [CKSyncEngine.PendingRecordZoneChange]) {
@@ -203,6 +232,11 @@
   extension SyncEngine {
     package struct SendRecordsCallback {
       fileprivate let operation: @Sendable () async -> Void
+      /// Whether a request was made (the batch was not `nil`).
+      fileprivate var didSend = false
+      fileprivate var hadFailures = false
+      /// Set when the whole request was refused.
+      fileprivate var wholeRequestError: CKError?
       package func receive() async {
         await operation()
       }
@@ -267,12 +301,26 @@
         return SendRecordsCallback {}
       }
 
-      let (saveResults, deleteResults) = try syncEngine.database.modifyRecords(
-        saving: batch.recordsToSave,
-        deleting: batch.recordIDsToDelete,
-        savePolicy: .ifServerRecordUnchanged,
-        atomically: batch.atomicByZone
-      )
+      var wholeRequestError: CKError?
+      let saveResults: [CKRecord.ID: Result<CKRecord, any Error>]
+      let deleteResults: [CKRecord.ID: Result<Void, any Error>]
+      do {
+        (saveResults, deleteResults) = try syncEngine.database.modifyRecords(
+          saving: batch.recordsToSave,
+          deleting: batch.recordIDsToDelete,
+          savePolicy: .ifServerRecordUnchanged,
+          atomically: batch.atomicByZone
+        )
+      } catch let error as CKError where error.isRequestRefusal {
+        // NB: The engine reports a refused request as every record failing with that error.
+        wholeRequestError = error
+        saveResults = Dictionary(
+          uniqueKeysWithValues: batch.recordsToSave.map { ($0.recordID, .failure(error)) }
+        )
+        deleteResults = Dictionary(
+          uniqueKeysWithValues: batch.recordIDsToDelete.map { ($0, .failure(error)) }
+        )
+      }
 
       var savedRecords: [CKRecord] = []
       var failedRecordSaves: [(record: CKRecord, error: CKError)] = []
@@ -303,17 +351,20 @@
       syncEngine.state.remove(
         pendingRecordZoneChanges: savedRecords.map { .saveRecord($0.recordID) }
       )
+      // NB: The real engine retries a refused request itself, so those changes stay pending.
       syncEngine.state.remove(
-        pendingRecordZoneChanges: failedRecordSaves.map { .saveRecord($0.record.recordID) }
+        pendingRecordZoneChanges: failedRecordSaves.filter { !$0.error.isRequestRefusal }
+          .map { .saveRecord($0.record.recordID) }
       )
       syncEngine.state.remove(
         pendingRecordZoneChanges: deletedRecordIDs.map { .deleteRecord($0) }
       )
       syncEngine.state.remove(
-        pendingRecordZoneChanges: failedRecordDeletes.keys.map { .deleteRecord($0) }
+        pendingRecordZoneChanges: failedRecordDeletes.filter { !$0.value.isRequestRefusal }.keys
+          .map { .deleteRecord($0) }
       )
 
-      return SendRecordsCallback { [savedRecords, failedRecordSaves, deletedRecordIDs, failedRecordDeletes] in
+      var callback = SendRecordsCallback { [savedRecords, failedRecordSaves, deletedRecordIDs, failedRecordDeletes] in
         await syncEngine.parentSyncEngine
           .handleEvent(
             .sentRecordZoneChanges(
@@ -325,6 +376,51 @@
             syncEngine: syncEngine
           )
       }
+      callback.didSend = true
+      callback.hadFailures = !failedRecordSaves.isEmpty || !failedRecordDeletes.isEmpty
+      callback.wholeRequestError = wholeRequestError
+      return callback
+    }
+
+    /// Runs one send cycle the way `CKSyncEngine` does: `willSendChanges`, batches of at most
+    /// 250 records until nothing is left, then `didSendChanges`.
+    ///
+    /// A cycle ends at the first batch with a failure. After a refusal (`serviceUnavailable`,
+    /// `requestRateLimited`, ...) the engine also waits for the scheduler: nothing is sent until
+    /// ``MockSyncEngine/advanceScheduler()`` or a manual `sendChanges()`.
+    // devmode: ending the cycle on any failed batch is the measured case (everything failed);
+    // whether the real engine continues after a partial failure is unverified.
+    package func runSendCycle(scope: CKDatabase.Scope) async throws {
+      let engine = syncEngine(for: scope)
+      let state = engine.state
+      let alreadyRunning = state.isSendCycleRunning.withValue { isRunning in
+        defer { isRunning = true }
+        return isRunning
+      }
+      guard !alreadyRunning else { return }
+      defer { state.isSendCycleRunning.setValue(false) }
+      state.isSendScheduled.setValue(false)
+
+      await handleEvent(.willSendChanges, syncEngine: engine)
+      while !state.pendingRecordZoneChanges.isEmpty {
+        let callback = try await sendPendingRecordZoneChanges(scope: scope)
+        guard callback.didSend else { break }
+        await callback.receive()
+        if callback.hadFailures {
+          if callback.wholeRequestError != nil { state.isSchedulerWaiting.setValue(true) }
+          break
+        }
+      }
+      await handleEvent(.didSendChanges, syncEngine: engine)
+    }
+
+    /// Runs the send the real engine would have scheduled, if there is one. Returns whether it ran.
+    @discardableResult
+    package func runScheduledSend(scope: CKDatabase.Scope) async throws -> Bool {
+      let state = syncEngine(for: scope).state
+      guard state.isSendScheduled.value, !state.isSchedulerWaiting.value else { return false }
+      try await runSendCycle(scope: scope)
+      return true
     }
 
     package func processPendingRecordZoneChanges(
