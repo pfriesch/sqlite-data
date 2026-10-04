@@ -19,6 +19,8 @@ _This is the original gap list (the "Mock today" column is the state before 2026
 | 3 | A batch holds **at most 250 records** (saves + deletes) | `recordZoneChangeBatch(pendingChanges:recordProvider:)` takes every pending change | `MockSyncEngine.recordZoneChangeBatch` | Tests with hundreds of changes send one huge batch, then hit the 200 limit below |
 | 4 | A request may carry **400 items and 2 MB** of record data, else `limitExceeded` (27) | `< 200` items, no byte limit | `MockCloudDatabase.modifyRecords` (`guard ... < 200`), `records(for:)` (`ids.count < 200`) | The mock is stricter than the server in count, blind in bytes |
 | 5 | **Transient refusals**: `serviceUnavailable` (6) / `requestRateLimited` (7) with `CKErrorRetryAfterKey`; the whole request fails and is reported as one `sentRecordZoneChanges` with every record in `failedRecordSaves`; then the engine waits for the scheduler (32 s to 12+ min), not for the retry-after | No way to make a request fail; `modifyRecords` only throws account/size errors | `MockCloudDatabase` | Throttle handling, `SendOutcome.isThrottled`, `resumesSendingAfterThrottle` and "engine quiet" are untestable |
+| 5b | Two throttle shapes: code 6 from the server (`CKErrorShouldThrottleClient`, `CKRetryAfter`), and code 7 from the **device**, which refuses locally without a request while an earlier throttle is active (TN3162). A **low battery** deferral is a third, with no retry-after, ending only when the battery recovers | None | `MockCloudDatabase` | The 6-then-7 sequence behind the `resumesSendingAfterThrottle` result cannot be reproduced |
+| 5c | `quotaExceeded` removes the change from the engine queue; the app must re-add it | Injectable since 2026-10-04 (`isQuotaExceeded`) | `MockCloudDatabase.modifyRecords` | The fork ignores it today (`SyncEngine.swift` ~2180), so changes would be lost; no test shows it yet |
 | 6 | Failed changes stay **in flight** until the request ends; on whole-request failure the engine reports them as failed | `recordZoneChangeBatch` removes the saves from pending when it builds the batch, `sendPendingRecordZoneChanges` removes saved and failed ones | `MockSyncEngine.recordZoneChangeBatch`, `SyncEngine.sendPendingRecordZoneChanges` | A crash or cancel between build and result loses changes in the mock; real state keeps `inFlightRecordModifications` and moves them back to pending on init |
 | 7 | **Fetches are paged** (200 records per page, `moreComing`) with per-zone change tokens that expire (`changeTokenExpired`); a dropped state means a full fetch | One `fetchedRecordZoneChanges` with everything newer than a single integer tag | `MockSyncEngine.fetchChanges` | Large-fetch behavior, paging order and token loss (the 16 MB state drop) are untested |
 | 8 | The state is archived on every update (`stateUpdate` with a serialization); its size grows with pending changes (about 50 KB transient per change, 45 MB at 120k) | `MockSyncEngineState` is two in-memory ordered sets, no serialization | `MockSyncEngineState` | The bounded queue and the oversized-state drop (`restoredState`) can only be tested by counting, not by size or restore |
@@ -96,24 +98,9 @@ Why: real accounts and networks fail in ways nobody scripts (signed out mid-sync
 - `OrderedSet` dedup: whether the real state dedups pending changes stays **[assumed]**.
 - Latency per request in real time, and a swift-dependencies `Clock` for the database (the simulated clock replaces it).
 
-## Order of work and risk
+### Additions from the reference review (not done)
 
-1. Events + cycle (1) and batch/limit constants (2): mechanical, no behavior change for old tests when the realistic mode is off. Enables testing `isSendingChanges`, the deferral and the bound with real sizes.
-2. Scheduling rule (3) with the regression test for `f0e8fb5`: first confirm the test fails on stock behavior (revert the deferral locally), then keep it.
-3. Error/throttle injection (4): enables the status API and resume option tests.
-4. Paging/tokens (5), clock (6), small fixes (7).
-
-Risks: the realistic mode changes the order of side effects, and many tests assert exact `assertInlineSnapshot` output of the mock database after a manual process call; keep those on the old mode and add new tests for the new one. Do not copy the real engine's timing, only its **ordering and limits**: tests stay deterministic.
-
-## Test list the improved mock should make possible
-
-- failed batch, changes re-queued in the callback: engine does not send again (old behavior, documents the trap); re-queued after `didSendChanges`: it does (current fix).
-- 250-record batches, 1,000-change bound, top-up after each `sentRecordZoneChanges`, with real sizes.
-- `lastSendOutcome`: saved, failed, error codes, `retryAfterSeconds`, `isThrottled`; `pendingChangeCount()` across engine state, buffer and overflow table.
-- throttle: all records fail with code 6 + retry-after, `didSendChanges`, engine silent until the scheduler advance; with `resumesSendingAfterThrottle` it sends again after the retry-after; a second refusal reschedules.
-- oversized saved state (over 16 MB) dropped at start and the queue rebuilt from metadata, using real `stateUpdate` serialization.
-- `limitExceeded` for 401 items and for 2 MB, and a paged fetch of 450 records.
-
-## Evidence for the real behavior
-
-The timing log, error codes and measurements behind the "Real" column are in [CloudKitSyncInternals.md](CloudKitSyncInternals.md), section 11 and sections 5-7. Nothing here was verified against Apple source; where marked **[assumed]** it needs a device check.
+- **Device-side throttle (code 7):** after a code 6, requests should fail immediately with code 7 and a retry-after, without reaching the database, until the retry-after passes (TN3162). Needed to reproduce the 6-then-7 sequence behind the `resumesSendingAfterThrottle` result.
+- **`quotaExceeded` is injectable now** (`isQuotaExceeded`), but the fork ignores it in `handleSentRecordZoneChanges`, so a test would show the dropped change. Write that test together with the fix.
+- Tests can set `automaticallySync = false` on the real `CKSyncEngine.Configuration` (WWDC23 10188).
+- Apple's sample tests two real engines against real CloudKit; a small device-only suite of that kind covers what no mock can (scheduler quiet time, real state).

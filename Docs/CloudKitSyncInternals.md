@@ -102,8 +102,13 @@ Related gotcha: awaiting a `CKSyncEngine` call from a task created inside a dele
 | 27 | `limitExceeded` | only in tests | more than 400 items or 2 MB of record data in one request (the real engine sends at most 250 records per batch) |
 | 22 | `batchRequestFailed` | no | a failure elsewhere in an atomic batch; library re-queues |
 | 23 | `zoneBusy`, 3/4 network, 9 `notAuthenticated` | no | transient |
+| 25 | `quotaExceeded` | no | **not retried by the engine, and the change leaves its queue [forum/Selig]. This fork's `handleSentRecordZoneChanges` ignores it (`continue`, `SyncEngine.swift` around line 2180), so a save that fails on a full iCloud quota is dropped until something re-enqueues the row. Known gap, not fixed, not tested.** A fix would re-queue after `didSendChanges` with a long wait and surface it in the status UI |
 
 Code 6 is CloudKit throttling (retry-after 11-76 s), also on plain uploads without any harness; see section 11. **[measured]**
+
+**Shape of the two throttle errors [Apple, TN3162]:** code 6 is the *server* refusing (HTTP 503; `userInfo` has `CKErrorShouldThrottleClient`, `CKRetryAfter`; underlying `CKInternalErrorDomain` 2022). Code 7 (`7/2008`) is the *device* refusing: CloudKit answers locally without sending anything, "rate limited due to an earlier error: ... 503", with its own retry-after. **[assumed]** This explains why forced `sendChanges()` calls after a 6 came back as 7 with fresh retry-afters (section 11, resume option): they were refused on the device, and each one may extend the wait. Not verified; check the in-process log for whether a request left the device.
+
+Apple's TN3162 also says: a retried request may be throttled again with a new retry-after; throttles can be triggered by many devices spiking together (our shared Development container); a **low battery** throttle is separate and ends only when the battery is high again; and turning iCloud off and on does not reset the retry interval and may cause more throttling (Oakley, via Tsai).
 
 ## 8. How to investigate (toolkit)
 
@@ -134,7 +139,7 @@ Built: the fork (commit `a2333e7`) exposes `SyncEngine.lastSendOutcome` (observa
 
 ## 10. Open questions
 
-- Is the post-callback re-queue the intended usage? Apple's sample code README does not say where `state.add` is called; filing a Feedback with the reproduction recipe would settle it.
+- Is the post-callback re-queue the intended usage? Partly answered: Apple's sample (`SyncedDatabase.handleSentRecordZoneChanges`) calls `state.add` *inside* the callback, so that is the documented pattern, but nothing says it triggers another send. That matches our measurement and forum thread 829402. A Feedback with the reproduction recipe would still settle it.
 - How long does the engine wait after `serviceUnavailable`? Answered in part: it does not follow the server's retry-after (25 s); it schedules a system activity and stayed silent 12+ minutes in the foreground. How long until iOS runs it is still unknown.
 - Upload speed: 6-13 s per 250 records ; other CloudKit environments not measured.
 - The bounded queue is outside the stock design (engine state = whole queue); Apple documents no limit on pending changes, but 40k+ failed for us.
@@ -143,6 +148,7 @@ Built: the fork (commit `a2333e7`) exposes `SyncEngine.lastSendOutcome` (observa
 ## 11. Measurements
 
 - **One engine cycle, 250 records:** build the batch 1.4 s (0.8-1.9; per record one metadata read, one user-DB read and one write transaction), CloudKit 3.6 s (2.4-4.4), handle the result 0.4 s; about 6.3 s per cycle, 2,360 records/min. A raw `CKDatabase.modifyRecords` of the same 250 records took 1.7-2.4 s. The engine's operations run at `qos=Utility` through a "container throttle queue" (in-process log). **[measured]**
+- **Claims we did not reproduce:** Selig reports uploads are split into 1 MB batches and a single `CKRecord` may be at most 1 MB. That differs from our 250 records / 2 MB request (250 x 3 KB = 750 KB passed, 5 MB was rejected), so treat his 1 MB batch figure as unconfirmed. The 1 MB per-record limit is the one to respect. **[forum]**
 - **Record size does not matter below ~3 KB:** 250 records of 40 B, 200 B and 3 KB all took 1.8-2.2 s raw; 250 x 20 KB (5 MB) was rejected (request size limit; Apple: 400 items and 2 MB per request). Count, not size, is the cost. **[measured]**
 - **`record.parent` doubles the save time:** 2.10 s vs 4.22 s per 250 records (10 alternating pairs, paced, no throttling). Tables registered with `tables:` (shareable) get a parent on child records; use `privateTables:` when nothing is shared. **[measured]**
 - **Throttling:** refusals arrive as `serviceUnavailable` (6) or `requestRateLimited` (7), retry-after 11-76 s; the refused request returns in 0.3-0.5 s. The engine sent 3-13 batches (750-1,750 records, 20-80 s) before the first refusal. Raw requests of 250 records, one every 12-15 s (about 1,200 records/min), passed 20 of 20; one every 5-7 s trips it. Apple (TN3162): limits are unpublished and not configurable; respect the retry-after. **[measured]**
@@ -155,7 +161,10 @@ Built: the fork (commit `a2333e7`) exposes `SyncEngine.lastSendOutcome` (observa
 
 - [CKSyncEngine, Apple documentation](https://developer.apple.com/documentation/cloudkit/cksyncengine-5sie5)
 - [WWDC23 10188: Sync to iCloud with CKSyncEngine (notes)](https://wwdcnotes.com/notes/wwdc23/10188)
-- [Apple sample: sample-cloudkit-sync-engine](https://github.com/apple/sample-cloudkit-sync-engine) (README only describes the app; no details on error handling)
+- [Apple sample: sample-cloudkit-sync-engine](https://github.com/apple/sample-cloudkit-sync-engine): the README says little, the code is the reference. Handles `serverRecordChanged`, `zoneNotFound`, `unknownItem` by re-queueing inside `sentRecordZoneChanges`; treats `requestRateLimited` as an unknown error (we treat it as transient); tests run two real engines against real CloudKit with `sendChanges()`/`fetchChanges()`
+- [TN3162: Understanding CloudKit throttles](https://developer.apple.com/documentation/technotes/tn3162-understanding-cloudkit-throttles): error shapes (6 vs 7), retry-after, low-battery throttle. It says `CKSyncEngine` "automatically re-schedules after the retry-after time"; our measurement (section 11) disagrees
+- [Christian Selig, CKSyncEngine questions and answers (2026)](https://christianselig.com/2026/01/cksyncengine/): `quotaExceeded` drops the change, zone deletion reasons, one engine per database, 1 MB record limit
+- [Michael Tsai, CloudKit throttles and debugging](https://mjtsai.com/blog/2024/05/29/cloudkit-throttles-and-debugging) (links Oakley: do not toggle iCloud to clear a throttle)
 - Apple Developer Forums: [CKSyncEngine doesn't send changes until app restarts (829402)](https://developer.apple.com/forums/thread/829402), [CKSyncEngine API design problems and maintenance status (771941)](https://developer.apple.com/forums/thread/771941) (an Apple engineer confirms batches are sent serially, undocumented), [CKSyncEngine keeps attempting to sync the same record (772887)](https://developer.apple.com/forums/thread/772887)
 - [SQLiteData](https://github.com/pointfreeco/sqlite-data) (the library we fork)
 
