@@ -211,6 +211,84 @@
         // The mock engine must end empty: drain it.
         try await syncEngine.private.sendChanges(CKSyncEngine.SendChangesOptions())
       }
+
+      // MARK: Save policies, change tags, paged fetch
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func savePoliciesMergeOrReplaceAndSkipTheTagCheck() async throws {
+        let database = syncEngine.private.database
+        let zoneID = try #require(database.state.withValue { $0.storage.keys.first })
+        let recordID = CKRecord.ID(recordName: "x", zoneID: zoneID)
+        let original = CKRecord(recordType: "T", recordID: recordID)
+        original["a"] = 1
+        original["b"] = 2
+        _ = try database.modifyRecords(saving: [original])
+
+        // '.changedKeys': only 'a' is sent, 'b' keeps its value.
+        let edited = try database.record(for: recordID)
+        edited["a"] = 3
+        _ = try database.modifyRecords(saving: [edited], savePolicy: .changedKeys)
+        var stored = try database.record(for: recordID)
+        #expect(stored["a"] as? Int == 3 && stored["b"] as? Int == 2)
+
+        // '.ifServerRecordUnchanged' merges too.
+        let edited2 = try database.record(for: recordID)
+        edited2["b"] = 5
+        _ = try database.modifyRecords(saving: [edited2])
+        stored = try database.record(for: recordID)
+        #expect(stored["a"] as? Int == 3 && stored["b"] as? Int == 5)
+
+        // '.allKeys': no tag needed, the record is replaced.
+        let replacement = CKRecord(recordType: "T", recordID: recordID)
+        replacement["a"] = 9
+        _ = try database.modifyRecords(saving: [replacement], savePolicy: .allKeys)
+        stored = try database.record(for: recordID)
+        #expect(stored["a"] as? Int == 9 && stored["b"] == nil)
+
+        // The same stale save fails with the default policy.
+        let again = CKRecord(recordType: "T", recordID: recordID)
+        #expect(try database.modifyRecords(saving: [again]).saveResults[recordID].map { (try? $0.get()) == nil } == true)
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func changeTagsCountPerZone() async throws {
+        let database = syncEngine.private.database
+        let otherZone = CKRecordZone(zoneName: "other")
+        _ = try database.modifyRecordZones(saving: [otherZone])
+        let zoneID = try #require(database.state.withValue { $0.storage.keys.first { $0 != otherZone.zoneID } })
+        let one = CKRecord(recordType: "T", recordID: .init(recordName: "1", zoneID: zoneID))
+        let two = CKRecord(recordType: "T", recordID: .init(recordName: "2", zoneID: otherZone.zoneID))
+        let results = try database.modifyRecords(saving: [one, two])
+        #expect(try results.saveResults[one.recordID]?.get()._recordChangeTag == 1)
+        #expect(try results.saveResults[two.recordID]?.get()._recordChangeTag == 1)
+        _ = try database.modifyRecords(deleting: [one.recordID, two.recordID])
+        try await syncEngine.private.fetchChanges(CKSyncEngine.FetchChangesOptions())
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func fetchesArePagedAndAnExpiredTokenForcesAFullFetch() async throws {
+        let engine = syncEngine.private
+        engine.state.isRealistic.setValue(true)
+        syncEngine.maxInMemoryPendingChanges.setValue(1_000)
+        try await seed(449)  // 450 records
+        try await engine.sendChanges(CKSyncEngine.SendChangesOptions())
+        #expect(serverRecordCount == 450)
+
+        try await engine.fetchChanges(CKSyncEngine.FetchChangesOptions())
+        #expect(engine.state.deliveredFetchPages.value == [200, 200, 50])
+
+        // The token advanced: nothing new.
+        engine.state.deliveredFetchPages.setValue([])
+        try await engine.fetchChanges(CKSyncEngine.FetchChangesOptions())
+        #expect(engine.state.deliveredFetchPages.value == [])
+
+        let zoneID = try #require(engine.database.state.withValue { $0.storage.keys.first })
+        engine.expireChangeToken(zoneID: zoneID)
+        try await engine.fetchChanges(CKSyncEngine.FetchChangesOptions())
+        #expect(engine.state.deliveredFetchPages.value == [200, 200, 50])
+        try await Task.sleep(for: .milliseconds(500))
+        try await engine.sendChanges(CKSyncEngine.SendChangesOptions())
+      }
     }
   }
 #endif

@@ -31,7 +31,6 @@
     }
 
     package func fetchChanges(_ options: CKSyncEngine.FetchChangesOptions) async throws {
-      let modifications: [CKRecord]
       let zoneIDs: [CKRecordZone.ID]
       switch options.scope {
       case .all:
@@ -44,39 +43,101 @@
         fatalError()
       }
 
-      modifications = database.state.withValue { state in
-        zoneIDs.reduce(into: [CKRecord]()) {
-          accum,
-          zoneID in
-          accum += ((state.storage[zoneID]?.records.values).map { Array($0) } ?? [])
+      typealias Page = (
+        zoneID: CKRecordZone.ID,
+        modifications: [CKRecord],
+        deletions: [(recordID: CKRecord.ID, recordType: CKRecord.RecordType)]
+      )
+      var pages: [Page] = []
+      var expiredZoneIDs: [CKRecordZone.ID] = []
+      for zoneID in zoneIDs {
+        if state.expiredZoneIDs.withValue({ $0.remove(zoneID) != nil }) {
+          // NB: The server refuses the stale token; the engine drops it and fetches everything.
+          expiredZoneIDs.append(zoneID)
+          state.changeTags.withValue { $0[zoneID] = nil }
+        }
+        let token = state.changeTags.value[zoneID] ?? 0
+        let modifications = database.state.withValue { state in
+          ((state.storage[zoneID]?.records.values).map { Array($0) } ?? [])
             .map { $0.copy() as! CKRecord }
             .filter {
               precondition(
                 $0._recordChangeTag != nil,
                 "Records stored in database should have their 'recordChangeTag' assigned."
               )
-              return $0._recordChangeTag! > self.state.changeTag.value
+              return $0._recordChangeTag! > token
             }
+            .sorted { $0._recordChangeTag! < $1._recordChangeTag! }
+        }
+        let deletions = database.state.withValue {
+          let records = $0.deletedRecords.filter { recordID, _ in recordID.zoneID == zoneID }
+          $0.deletedRecords.removeAll { recordID, _ in recordID.zoneID == zoneID }
+          return records
+        }
+        guard !modifications.isEmpty || !deletions.isEmpty else { continue }
+        // NB: Real fetches return 200 records per page ('moreComing'); the token advances per page.
+        let chunks = stride(from: 0, to: max(modifications.count, 1), by: Self.maxRecordsPerFetchPage)
+          .map { Array(modifications[$0..<min($0 + Self.maxRecordsPerFetchPage, modifications.count)]) }
+        for (index, chunk) in chunks.enumerated() {
+          pages.append((zoneID, chunk, index == 0 ? deletions : []))
         }
       }
 
-      let deletions = database.state.withValue {
-        let records = $0.deletedRecords.filter { recordID, _ in
-          zoneIDs.contains(recordID.zoneID)
+      if state.isRealistic.value {
+        await parentSyncEngine.handleEvent(.willFetchChanges, syncEngine: self)
+        for zoneID in expiredZoneIDs {
+          await parentSyncEngine.handleEvent(.willFetchRecordZoneChanges(zoneID: zoneID), syncEngine: self)
+          await parentSyncEngine.handleEvent(
+            .didFetchRecordZoneChanges(zoneID: zoneID, error: CKError(.changeTokenExpired)),
+            syncEngine: self
+          )
         }
-        $0.deletedRecords.removeAll { lhsRecordID, _ in
-          records.contains { rhsRecordID, _ in lhsRecordID == rhsRecordID }
+        for page in pages {
+          await parentSyncEngine.handleEvent(
+            .willFetchRecordZoneChanges(zoneID: page.zoneID), syncEngine: self
+          )
+          await deliver(page.modifications, page.deletions, zoneID: page.zoneID)
+          await parentSyncEngine.handleEvent(
+            .didFetchRecordZoneChanges(zoneID: page.zoneID, error: nil), syncEngine: self
+          )
         }
-        return records
+        await parentSyncEngine.handleEvent(.didFetchChanges, syncEngine: self)
+      } else if !pages.isEmpty {
+        for page in pages {
+          advanceToken(page.modifications, zoneID: page.zoneID)
+        }
+        await parentSyncEngine.handleEvent(
+          .fetchedRecordZoneChanges(
+            modifications: pages.flatMap(\.modifications),
+            deletions: pages.flatMap(\.deletions)
+          ),
+          syncEngine: self
+        )
       }
+    }
 
-      guard !modifications.isEmpty || !deletions.isEmpty
-      else { return }
+    /// The most records one fetch page returns.
+    package static let maxRecordsPerFetchPage = 200
 
-      state.changeTag.withValue { changeTag in
-        changeTag = modifications.compactMap(\._recordChangeTag).max() ?? changeTag
+    /// Makes the next fetch of the zone fail with `changeTokenExpired`, then fetch everything.
+    package func expireChangeToken(zoneID: CKRecordZone.ID) {
+      state.expiredZoneIDs.withValue { _ = $0.insert(zoneID) }
+    }
+
+    private func advanceToken(_ modifications: [CKRecord], zoneID: CKRecordZone.ID) {
+      state.changeTags.withValue { tags in
+        tags[zoneID] = modifications.compactMap(\._recordChangeTag).max() ?? tags[zoneID]
       }
+    }
 
+    private func deliver(
+      _ modifications: [CKRecord],
+      _ deletions: [(recordID: CKRecord.ID, recordType: CKRecord.RecordType)],
+      zoneID: CKRecordZone.ID
+    ) async {
+      advanceToken(modifications, zoneID: zoneID)
+      state.deliveredFetchPages.withValue { $0.append(modifications.count) }
+      guard !modifications.isEmpty || !deletions.isEmpty else { return }
       await parentSyncEngine.handleEvent(
         .fetchedRecordZoneChanges(modifications: modifications, deletions: deletions),
         syncEngine: self
@@ -155,7 +216,11 @@
 
   @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
   package final class MockSyncEngineState: CKSyncEngineStateProtocol {
-    package let changeTag = LockIsolated(0)
+    /// Per-zone fetch tokens: the highest change tag already delivered.
+    package let changeTags = LockIsolated<[CKRecordZone.ID: Int]>([:])
+    /// Sizes of the pages `fetchChanges` delivered, in order (realistic mode).
+    package let deliveredFetchPages = LockIsolated<[Int]>([])
+    package let expiredZoneIDs = LockIsolated<Set<CKRecordZone.ID>>([])
     /// Opt-in: behave like `CKSyncEngine` about when work happens. Failed changes are re-queued
     /// after `didSendChanges`, `sendChanges()` runs a whole cycle with `willSendChanges`/
     /// `didSendChanges`, and a send is only scheduled by changes added outside a cycle. Off by

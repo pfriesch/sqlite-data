@@ -12,13 +12,14 @@
     let dataManager = Dependency(\.dataManager)
 
     package struct State {
-      private var lastRecordChangeTag = 0
+      private var lastRecordChangeTags: [CKRecordZone.ID: Int] = [:]
       package var storage: [CKRecordZone.ID: Zone] = [:]
       var assets: [AssetID: Data] = [:]
       var deletedRecords: [(CKRecord.ID, CKRecord.RecordType)] = []
-      mutating func nextRecordChangeTag() -> Int {
-        lastRecordChangeTag += 1
-        return lastRecordChangeTag
+      /// Change tags count per zone, like the per-zone change tokens they are fetched by.
+      mutating func nextRecordChangeTag(in zoneID: CKRecordZone.ID) -> Int {
+        lastRecordChangeTags[zoneID, default: 0] += 1
+        return lastRecordChangeTags[zoneID]!
       }
     }
 
@@ -227,8 +228,7 @@
         var saveResults: [CKRecord.ID: Result<CKRecord, any Error>] = [:]
         var deleteResults: [CKRecord.ID: Result<Void, any Error>] = [:]
 
-        switch savePolicy {
-        case .ifServerRecordUnchanged:
+        do {
           for recordToSave in recordsToSave {
             if let share = recordToSave as? CKShare {
               let isSavingRootRecord = recordsToSave.contains(where: {
@@ -305,8 +305,7 @@
 
               guard let databaseCopy = recordToSave.copy() as? CKRecord
               else { fatalError("Could not copy CKRecord.") }
-              databaseCopy._recordChangeTag = state.nextRecordChangeTag()
-
+              
               for key in databaseCopy.allKeys() {
                 guard let assetURL = (databaseCopy[key] as? CKAsset)?.fileURL
                 else { continue }
@@ -315,10 +314,24 @@
                   .load(assetURL)
               }
 
-              // TODO: This should merge copy's values to more accurately reflect reality
-              state.storage[recordToSave.recordID.zoneID]?.records[recordToSave.recordID] =
-                databaseCopy
-              saveResults[recordToSave.recordID] = .success(databaseCopy.copy() as! CKRecord)
+              // NB: The server applies only the changed keys; keys the client did not change keep
+              //     the stored value. '.allKeys' replaces the record.
+              if savePolicy != .allKeys, !(recordToSave is CKShare),
+                let existing = existingRecord
+              {
+                let changedKeys = Set(recordToSave.changedKeys())
+                for key in existing.allKeys() where !changedKeys.contains(key) {
+                  if let value = existing[key] {
+                    databaseCopy[key] = value
+                  } else {
+                    databaseCopy.encryptedValues[key] = existing.encryptedValues[key]
+                  }
+                }
+              }
+              let stored = databaseCopy
+              stored._recordChangeTag = state.nextRecordChangeTag(in: recordToSave.recordID.zoneID)
+              state.storage[recordToSave.recordID.zoneID]?.records[recordToSave.recordID] = stored
+              saveResults[recordToSave.recordID] = .success(stored.copy() as! CKRecord)
 
               // NB: "Touch" parent records when saving a child:
               if let parent = recordToSave.parent,
@@ -329,11 +342,17 @@
                   .copy()
                   as? CKRecord
               {
-                parentRecord._recordChangeTag = state.nextRecordChangeTag()
+                parentRecord._recordChangeTag = state.nextRecordChangeTag(in: parent.recordID.zoneID)
                 state.storage[parent.recordID.zoneID]?.records[parent.recordID] = parentRecord
               }
             }
 
+            guard savePolicy == .ifServerRecordUnchanged
+            else {
+              // '.allKeys' and '.changedKeys' do not check change tags.
+              saveRecordToDatabase()
+              continue
+            }
             switch (existingRecord, recordToSave._recordChangeTag) {
             case (.some(let existingRecord), .some(let recordToSaveChangeTag)):
               // We are trying to save a record with a change tag that also already exists in the
@@ -377,10 +396,6 @@
               saveRecordToDatabase()
             }
           }
-        case .allKeys, .changedKeys:
-          fatalError()
-        @unknown default:
-          fatalError()
         }
         for recordIDToDelete in recordIDsToDelete {
           guard state.storage[recordIDToDelete.zoneID] != nil

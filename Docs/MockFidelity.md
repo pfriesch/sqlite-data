@@ -48,7 +48,10 @@ Done, tested in `RealisticMockTests`: steps 1-4 of the design, in part.
 - Opt-in `MockSyncEngineState.stateBytesPerPendingChange`: posts `stateUpdate` with a stand-in serialization (about that many stored bytes per pending change; 375 on device), so `SyncEngine.restoredState` and its 16 MB guard run for real.
 - Opt-in `MockCloudDatabase.profile` (`.measuredDevelopment`): simulated time per request (8.4 ms per record, x2.01 for a record with `parent`, i.e. `tables:` vs `privateTables:`), a token-bucket throttle (1,000 burst, 20 records/s), refusal latency, and the scheduler wait. Time is simulated (`simulatedSeconds`), never slept. Unmeasured and left at 1: Production vs Development speed (`environmentMultiplier`), record size (3 KB did not matter), assets, shared database, several zones, `atomicByZone`.
 - `SyncEngine.throttleClock` lets tests drive `resumesSendingAfterThrottle` with a `TestClock`.
-- Not done: in-flight tracking, steps 5-7.
+- Fetch (item 5): per-zone tokens, records in change-tag order, pages of 200 (`deliveredFetchPages`), `expireChangeToken(zoneID:)` answers `changeTokenExpired` and forces a full fetch. Events and paging only in realistic mode; otherwise one event as before.
+- Clock and rate limit (item 6): done as the simulated clock and token bucket of the profile, not as an injected `Clock`.
+- Small fixes (item 7): `.changedKeys`/`.allKeys` supported (no tag check; `.changedKeys` and the default policy keep unchanged keys from the stored record, `.allKeys` replaces it); change tags count per zone. Not done: `cancelOperations` (nothing is in flight in the mock), the `OrderedSet` dedup question stays **[assumed]**.
+- Not done: in-flight tracking (deviation 6), zone-level errors (deviation 9), per-field server merge beyond changed keys.
 
 ## Order of work and risk
 
