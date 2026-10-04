@@ -158,6 +158,15 @@ Built: the fork (commit `a2333e7`) exposes `SyncEngine.lastSendOutcome` (observa
 - **Metadata DB:** `lastKnownServerRecord` averages 2.4 KB, `_lastKnownServerRecordAllFields` 7.9 KB; 232,553 rows hold 250 MB + 813 MB of blobs in a 1.6 GB file next to a 1.4 GB WAL. A filter on `_isDeleted` took 0.12 s on a Mac copy, so reordering columns is not shown to help; test WAL checkpointing first. **[measured]**
 - **Full fetch:** after the saved state was dropped, 39 pages of 200 records at about 3.4 s per page. **[measured]**
 
+## 12. Upstream PRs reviewed (2026-10-04)
+
+Open `pointfreeco/sqlite-data` PRs checked against this fork's `SyncEngine.swift`. Nothing is tested yet.
+
+- **#543 `lastRecordZoneFetchError`: optional.** Our `.didFetchRecordZoneChanges` handler only decrements a counter, so fetch errors are invisible. If the status UI needs them, put them into the `SendOutcome` pattern rather than adding a second error property.
+- **#500 pending counts: skip.** It counts only engine state, which the fork caps at 1,000, so it would undercount; `pendingChangeCount()` already adds the buffer and the overflow table. The save/delete split is only worth taking if the UI needs it.
+- **#335 quota callback: skip.** Our quota handling already does this; the UI can read `SendOutcome.isQuotaExceeded`.
+- **#421: skip for now.** It changes the metadata schema and needs a migration. Treat it as a separate project, and only if a test shows the delete-then-reinsert loss on this fork.
+
 ## Sources
 
 - [CKSyncEngine, Apple documentation](https://developer.apple.com/documentation/cloudkit/cksyncengine-5sie5)
