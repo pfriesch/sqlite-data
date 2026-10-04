@@ -10,6 +10,8 @@ Principle for every change below: the mock should be **as strict as the real thi
 
 ## Deviations, ordered by how much they hide
 
+_This is the original gap list (the "Mock today" column is the state before 2026-10-04). What is closed, and how, is in "What the mock does now, and why" below._
+
 | # | Real | Mock today | Where | Consequence |
 |---|---|---|---|---|
 | 1 | A send **cycle** has `willSendChanges`, then N batches (each: `nextRecordZoneChangeBatch`, request, `sentRecordZoneChanges`), then one `didSendChanges`. Fetch has `willFetchChanges`/`didFetchChanges` (also `willFetchRecordZoneChanges`/`didFetchRecordZoneChanges`). `stateUpdate` is posted after nearly every state change | Posts only `sentRecordZoneChanges`, `sentDatabaseChanges`, `fetchedRecordZoneChanges`. Never `will/didSendChanges`, `will/didFetch*`, `stateUpdate` | `MockSyncEngine.sendChanges/fetchChanges`, `SyncEngine.sendPendingRecordZoneChanges` | `isSendingChanges`/`isFetchingChanges` never go true; the deferral after `didSendChanges` never runs (the code path is guarded `syncEngine is CKSyncEngine`), `lastSendOutcome`-based UI cannot be tested end to end |
@@ -37,23 +39,62 @@ Keep the existing hand-driven API (existing tests keep working) and add an **opt
 6. **Clock and rate limit (fix 11), optional.** Inject a `Clock` (swift-dependencies `continuousClock`, already used elsewhere) and a token bucket in the database (about 1,200 records/min, burst 750-1,750) that fails with `serviceUnavailable` + retry-after when drained. Lets pacing/backoff logic be tested without sleeping.
 7. **Cheap fidelity fixes that need no new machinery:** make `savePolicy` explicit and support `.allKeys`/`.changedKeys` instead of `fatalError()`; implement the `TODO` (merge changed fields on save); give `_recordChangeTag` a per-zone counter; make `cancelOperations` clear in-flight work; keep `OrderedSet` dedup and document that real state also dedups (**[assumed]**, verify).
 
-## Status (2026-10-04)
+## What the mock does now, and why (2026-10-04)
 
-Done, tested in `RealisticMockTests`: steps 1-4 of the design, in part.
-- Cycle: `SyncEngine.runSendCycle(scope:)` posts `willSendChanges`/`didSendChanges` around batches; ends at the first failed batch. Opt-in via `MockSyncEngine.state.isRealistic`; `sendChanges()` runs it when on.
-- Limits: 250 records per batch, 400 items / 2 MB per request (`limitExceeded`), always on.
-- Scheduling: `isSendScheduled` is set only by changes added outside a cycle; `runScheduledSend(scope:)` runs it. The `f0e8fb5` regression test fails when the deferral is reverted (checked).
-- Injection: `database.failNextRequests(_:with:)`, `CKError.throttled(retryAfter:)`; a refused request fails every record, which stays pending, and the engine waits until `advanceScheduler()` or a manual `sendChanges()`.
-- Mock no longer removes saves from pending when it builds a batch (deviation 6, partly).
-- Opt-in `MockSyncEngineState.stateBytesPerPendingChange`: posts `stateUpdate` with a stand-in serialization (about that many stored bytes per pending change; 375 on device), so `SyncEngine.restoredState` and its 16 MB guard run for real.
-- Opt-in `MockCloudDatabase.profile` (`.measuredDevelopment`): simulated time per request (8.4 ms per record, x2.01 for a record with `parent`, i.e. `tables:` vs `privateTables:`), a token-bucket throttle (1,000 burst, 20 records/s), refusal latency, and the scheduler wait. Time is simulated (`simulatedSeconds`), never slept. Unmeasured and left at 1: Production vs Development speed (`environmentMultiplier`), record size (3 KB did not matter), assets, shared database, several zones, `atomicByZone`.
-- `SyncEngine.throttleClock` lets tests drive `resumesSendingAfterThrottle` with a `TestClock`.
-- Fetch (item 5): per-zone tokens, records in change-tag order, pages of 200 (`deliveredFetchPages`), `expireChangeToken(zoneID:)` answers `changeTokenExpired` and forces a full fetch. Events and paging only in realistic mode; otherwise one event as before.
-- Clock and rate limit (item 6): done as the simulated clock and token bucket of the profile, not as an injected `Clock`.
-- Small fixes (item 7): `.changedKeys`/`.allKeys` supported (no tag check; `.changedKeys` and the default policy keep unchanged keys from the stored record, `.allKeys` replaces it); change tags count per zone. Not done: `cancelOperations` (nothing is in flight in the mock), the `OrderedSet` dedup question stays **[assumed]**.
-- In flight (deviation 6): a built batch leaves pending and stays in `inFlightRecordZoneChanges` until its result; `cancelOperations()` puts it back.
-- Zone errors (deviation 9): `database.state.isQuotaExceeded`, `userDeletedZone` per zone, `changeTokenExpired`; `zoneBusy`/`networkFailure` through `failNextRequests`.
-- Opt-in fuzzing, `database.setFuzz(.init(seed:intensity:faults:))`: per request (or per send cycle for the account status) a fault fires with probability `intensity`: refusals (6, 7, 23, 3, 4), account errors (9, 36), account status flips (`noAccount`, `restricted`, ...) that end when the scheduler fires. Seeded and logged in `fuzzLog`; off by default. Tests assert that everything still arrives for seeds 1-3 at intensity 0.6. Not fuzzed: sign-out/switch events (they delete local data without a delegate), per-record errors.
+Everything below is covered by `Tests/SQLiteDataTests/CloudKitTests/RealisticMockTests.swift` unless noted. **Always on** changes affect every test; **opt-in** ones need a switch, so the 317 older tests (which drive one batch by hand and assert exact snapshots) keep their behavior.
+
+### Always on
+
+| Change | Why |
+|---|---|
+| A batch holds at most 250 records (`SyncEngine.maxBatchRecords`); a request at most 400 items and 2 MB (`MockCloudDatabase.maxItemsPerRequest`/`maxBytesPerRequest`), else `limitExceeded` | Deviations 3 and 4. The old limit was "under 200", so tests with real sizes failed, and 2 MB was never checked. The byte size is estimated (strings, data), enough to trip the limit |
+| A built batch leaves pending and stays in `state.inFlightRecordZoneChanges` until its result; `cancelOperations()` puts it back | Deviation 6. The old mock dropped saves when it built the batch, so a refused request lost them. A refused request now returns its changes to pending, as the real engine does |
+| `.changedKeys` and `.allKeys` save policies; the default policy and `.changedKeys` keep unchanged keys from the stored record, `.allKeys` replaces it, neither of those two checks change tags | Deviation 10. They were `fatalError()`, and a save replaced the record (a `TODO`). The merge runs from the incoming record (keeping its `share`/`parent`) because `share` is not a changed key |
+| Change tags count per zone, fetch tokens are per zone | Deviation 10. One global counter made cross-zone tag comparison work by accident |
+| Zone failures: `database.state.isQuotaExceeded` (saves fail `quotaExceeded`, deletes work), `database.state.userDeletedZones` (`userDeletedZone`) | Deviation 9: no test could produce them |
+| `nextRecordZoneChangeBatch` reads metadata in one query and rows in one query per table for the first 250 changes, and writes the last-known server records in one transaction (`SyncEngine.swift`, not mock) | Measured: the per-record reads and writes were about 1.4 s of a 6.3 s cycle. Records outside the prefetch fall back to per-record reads. Not timed since |
+
+### Opt-in: behave like `CKSyncEngine` (`MockSyncEngine.state.isRealistic = true`)
+
+| What | Why |
+|---|---|
+| `SyncEngine.runSendCycle(scope:)`: `willSendChanges`, batches until nothing is left, `didSendChanges`. `sendChanges()` runs it. A cycle ends at the first failed batch | Deviation 1: `isSendingChanges` never went true, `didSendChanges` never came. Ending at a failure is the measured case (a refused request fails everything); whether the real engine continues after a partial failure is **unverified** |
+| Failed changes are re-queued after `didSendChanges` (the `f0e8fb5` deferral now also runs on the mock) | Deviation 2: the deferral was guarded by `syncEngine is CKSyncEngine`, so reverting it still passed. The regression test fails without it (checked) |
+| `state.isSendScheduled` is set only by changes added outside a cycle; `runScheduledSend(scope:)` runs it | Deviations 2 and 12: the real engine does not send again for changes added inside a callback |
+| Refusals: `database.failNextRequests(_:with:)`, `CKError.throttled(retryAfter:)`. Every record fails with that error and stays pending; the engine then waits until `advanceScheduler()` or a manual `sendChanges()` | Deviation 5: throttling, `SendOutcome.isThrottled` and "engine quiet" were untestable. The error set that fails a whole request is `isRequestRefusal` |
+| `expireChangeToken(zoneID:)`; fetches in pages of 200 (`deliveredFetchPages`) with will/did fetch events | Deviation 7. Outside realistic mode a fetch is still one event |
+| `SyncEngine.throttleClock` (default `ContinuousClock`) drives the wait of `resumesSendingAfterThrottle` | The option waited at least 5 s of real time; a `TestClock` makes it testable |
+| `state.stateBytesPerPendingChange` (for example 375, the device value) posts `stateUpdate` with a stand-in serialization (JSON around a property list, sized by the pending changes) | Deviation 8. `CKSyncEngine.State.Serialization` cannot be built by us, so this is not CloudKit's archive: it exercises `handleStateUpdate`, the stored size and `SyncEngine.restoredState` with its 16 MB drop, not CloudKit's decoding |
+
+### Opt-in: cost and throttle profile (`database.profile.setValue(.measuredDevelopment)`)
+
+Purpose: run a workload through the mock and compare configurations (or against device measurements) without a device. Time is **simulated**: it advances only through requests and `advanceScheduler()`, never by sleeping, so runs stay fast and repeatable. Read it from `database.simulatedSeconds`.
+
+| Setting | Value | Source |
+|---|---|---|
+| Time per record | 8.4 ms (2.10 s per 250) | measured, raw `modifyRecords` |
+| Record with `parent` (`tables:`, not `privateTables:`) | x2.01 (4.22 s vs 2.10 s per 250) | measured; the profile picks it up from `record.parent`, so registering a table as private or shared changes the result by itself |
+| Throttle | token bucket, burst 1,000 records, 20 records/s, retry-after at least 11 s | measured: trips at about 750-1,750 records within 20-40 s, passes about 1,200 records/min, retry-after 11-76 s |
+| Refused request | 0.4 s | measured 0.3-0.5 s |
+| Scheduler wait after a refusal | 60 s default (`schedulerWaitSeconds`) | observed 32 s to 12+ min, cause unknown, so a knob |
+| `environmentMultiplier` | 1.0 | Production vs Development is **not measured** |
+
+Other registration and engine settings were checked and have no measurement, so they are not modeled: record size (3 KB did not change batch time), assets, the shared database, several zones, `atomicByZone`. Add a field to `Profile` when you measure one.
+
+### Opt-in: fuzzing unexpected iCloud behavior (`database.setFuzz(.init(seed:intensity:faults:))`)
+
+Why: real accounts and networks fail in ways nobody scripts (signed out mid-sync, restricted, rate limits). The fuzzer rolls per request, and per send cycle for the account status, and injects a fault with probability `intensity` (0 never, 1 always; the caller chooses, default is off).
+
+- `faults`: `.refusals` (6, 7, 23, 3, 4), `.accountErrors` (9, 36), `.accountStatus` (the account flips to `noAccount`, `restricted`, `temporarilyUnavailable` or `couldNotDetermine` when a cycle starts; the cycle sends nothing and waits; `advanceScheduler()` brings the account back).
+- Reproducible: SplitMix64 from `seed`; `fuzzLog` lists what was injected. A failing run replays with the same seed and the same requests.
+- Test: for seeds 1-3 at intensity 0.6, 300 changes still all reach the server and pending ends empty (nothing lost).
+- Not fuzzed: sign-out and switch-account events (without a delegate they delete local data, so they need their own scenario), per-record errors (an `unknownItem` on a record the server has would re-save without a change tag and fail in the mock in a way the real server would not).
+
+### Not done
+
+- Per-field server merge beyond changed keys: there is no further behavior to model that the two policies above do not already cover.
+- `OrderedSet` dedup: whether the real state dedups pending changes stays **[assumed]**.
+- Latency per request in real time, and a swift-dependencies `Clock` for the database (the simulated clock replaces it).
 
 ## Order of work and risk
 

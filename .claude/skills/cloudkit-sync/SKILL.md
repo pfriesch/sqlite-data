@@ -82,8 +82,8 @@ print(len(members), root['needsToFetchDatabaseChanges'])
 
 - Metadata `_isDeleted` filter was fast (0.12 s) on a Mac copy; the 5.5 min rebuild on the phone may be a never-checkpointed 1.4 GB WAL or cold flash. Test WAL checkpoint / `journal_size_limit` before touching the schema.
 - How long iOS waits after `serviceUnavailable`: unknown. Production-environment speed: not measured (Development is the slower one).
-- `MockSyncEngine` fidelity fixes not done; the full gap list and plan are in `Docs/MockFidelity.md`. Full reference: `Docs/CloudKitSyncInternals.md`.
-- Per-record reads/writes in `nextRecordZoneChangeBatch` (~1.4 s of a 6.3 s cycle) could be batched; matters little while throttling dominates.
+- `MockSyncEngine` fidelity: most gaps are closed behind opt-in switches (realistic cycle, cost/throttle profile, fuzzing); what is modeled, why, and what is not is in `Docs/MockFidelity.md`. Full reference: `Docs/CloudKitSyncInternals.md`.
+- The reads/writes in `nextRecordZoneChangeBatch` are batched now (one metadata read, one read per table, one write per batch); the gain was not timed on a device.
 
 ## Sources
 
