@@ -1,6 +1,6 @@
 # Making `MockSyncEngine` and `MockCloudDatabase` behave like CloudKit
 
-_2026-10-04. Files: `Sources/SQLiteData/CloudKit/Internal/MockSyncEngine.swift`, `MockCloudDatabase.swift`, `MockCloudContainer.swift`. Reference for what the real thing does: [CloudKitSyncInternals.md](CloudKitSyncInternals.md). "Real" below means CKSyncEngine and CloudKit as measured on an iPhone (iOS 27.0.1, Development environment)._
+_2026-10-04. Files: `Sources/SQLiteData/CloudKit/Internal/MockSyncEngine.swift`, `MockCloudDatabase.swift`, `MockCloudContainer.swift`. Reference for what the real thing does: [CloudKitSyncInternals.md](CloudKitSyncInternals.md). "Real" below means CKSyncEngine and CloudKit as measured on a real device._
 
 ## Why this matters
 
@@ -66,7 +66,7 @@ Everything below is covered by `Tests/SQLiteDataTests/CloudKitTests/RealisticMoc
 | `SyncEngine.throttleClock` (default `ContinuousClock`) drives the wait of `resumesSendingAfterThrottle` | The option waited at least 5 s of real time; a `TestClock` makes it testable |
 | `state.stateBytesPerPendingChange` (for example 375, the device value) posts `stateUpdate` with a stand-in serialization (JSON around a property list, sized by the pending changes) | Deviation 8. `CKSyncEngine.State.Serialization` cannot be built by us, so this is not CloudKit's archive: it exercises `handleStateUpdate`, the stored size and `SyncEngine.restoredState` with its 16 MB drop, not CloudKit's decoding |
 
-### Opt-in: cost and throttle profile (`database.profile.setValue(.measuredDevelopment)`)
+### Opt-in: cost and throttle profile (`database.profile.setValue(.measured)`)
 
 Purpose: run a workload through the mock and compare configurations (or against device measurements) without a device. Time is **simulated**: it advances only through requests and `advanceScheduler()`, never by sleeping, so runs stay fast and repeatable. Read it from `database.simulatedSeconds`.
 
@@ -77,7 +77,7 @@ Purpose: run a workload through the mock and compare configurations (or against 
 | Throttle | token bucket, burst 1,000 records, 20 records/s, retry-after at least 11 s | measured: trips at about 750-1,750 records within 20-40 s, passes about 1,200 records/min, retry-after 11-76 s |
 | Refused request | 0.4 s | measured 0.3-0.5 s |
 | Scheduler wait after a refusal | 60 s default (`schedulerWaitSeconds`) | observed 32 s to 12+ min, cause unknown, so a knob |
-| `environmentMultiplier` | 1.0 | Production vs Development is **not measured** |
+| `environmentMultiplier` | 1.0 | Other CloudKit environments are **not measured** |
 
 Other registration and engine settings were checked and have no measurement, so they are not modeled: record size (3 KB did not change batch time), assets, the shared database, several zones, `atomicByZone`. Add a field to `Profile` when you measure one.
 

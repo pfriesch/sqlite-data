@@ -113,8 +113,8 @@
     /// reports the time and throttling the real service would show for the same configuration.
     ///
     /// Time is *simulated*: it only advances through ``simulatedSeconds``, never by sleeping, so
-    /// runs stay fast and deterministic. Numbers are from the iPhone measurements in
-    /// `Docs/CloudKitSyncInternals.md` (Development environment). Only what was measured is
+    /// runs stay fast and deterministic. Numbers are from the device measurements in
+    /// `Docs/CloudKitSyncInternals.md`. Only what was measured is
     /// modeled; everything else is a knob left at 1.
     package struct Profile: Sendable {
       /// Raw `modifyRecords` time per record: 2.10 s per 250 records without `parent`.
@@ -122,7 +122,7 @@
       /// A record with `record.parent` (tables registered with `tables:`, not `privateTables:`)
       /// takes this many times longer: 4.22 s vs 2.10 s per 250 records.
       package var parentMultiplier = 4.22 / 2.10
-      /// Production vs Development speed is not measured; Development is the slower one.
+      /// Speed in other CloudKit environments is not measured.
       package var environmentMultiplier = 1.0
       /// A refused request returns in 0.3-0.5 s.
       package var refusalSeconds = 0.4
@@ -140,7 +140,7 @@
         package init() {}
       }
 
-      package static let measuredDevelopment = Profile()
+      package static let measured = Profile()
       package init() {}
     }
 

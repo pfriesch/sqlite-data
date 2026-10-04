@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Fork of `pointfreeco/sqlite-data` (`pfriesch/sqlite-data`), used by the Wanderlust iOS app for CloudKit sync.
+Fork of `pointfreeco/sqlite-data` (`pfriesch/sqlite-data`), used by an iOS app for CloudKit sync.
 
 - **No pull requests to pointfreeco/sqlite-data.** Changes live only in this fork.
 - Tests: `swift test` (333 pass). `MockSyncEngine` and `MockCloudDatabase` are faithful to CloudKit only where `Docs/MockFidelity.md` says so; the realistic behavior (send cycle, scheduling rule, throttle and cost profile, `stateUpdate`, fuzzing) is opt-in per test. Behavior that depends on real timing (deferred re-queue, throttle resume, scheduler wait length) can only be verified on a real device.

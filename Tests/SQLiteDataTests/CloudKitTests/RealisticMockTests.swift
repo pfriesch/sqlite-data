@@ -130,7 +130,7 @@
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test func aFastUploadTripsTheThrottleAndTheSchedulerRefillsIt() async throws {
         syncEngine.private.state.isRealistic.setValue(true)
-        syncEngine.private.database.profile.setValue(.measuredDevelopment)
+        syncEngine.private.database.profile.setValue(.measured)
         syncEngine.maxInMemoryPendingChanges.setValue(2_000)
         try await seed(1_499)
 

@@ -5,7 +5,7 @@ description: How CKSyncEngine and SQLiteData's SyncEngine behave in practice (sc
 
 # CloudKit sync: CKSyncEngine, SQLiteData, this fork
 
-Facts are marked **[Apple]** (documented), **[measured]** (observed on an iPhone 13, iOS 27.0.1, CloudKit Development environment) or **[assumed]**.
+Facts are marked **[Apple]** (documented), **[measured]** (observed on a real device) or **[assumed]**.
 
 ## Layers
 
@@ -81,10 +81,10 @@ print(len(members), root['needsToFetchDatabaseChanges'])
 ## Open questions
 
 - Metadata `_isDeleted` filter was fast (0.12 s) on a Mac copy; the 5.5 min rebuild on the phone may be a never-checkpointed 1.4 GB WAL or cold flash. Test WAL checkpoint / `journal_size_limit` before touching the schema.
-- How long iOS waits after `serviceUnavailable`: unknown. Production-environment speed: not measured (Development is the slower one).
+- How long iOS waits after `serviceUnavailable`: unknown. Speed in other CloudKit environments: not measured.
 - `MockSyncEngine` fidelity: most gaps are closed behind opt-in switches (realistic cycle, cost/throttle profile, fuzzing); what is modeled, why, and what is not is in `Docs/MockFidelity.md`. Full reference: `Docs/CloudKitSyncInternals.md`.
 - The reads/writes in `nextRecordZoneChangeBatch` are batched now (one metadata read, one read per table, one write per batch); the gain was not timed on a device.
 
 ## Sources
 
-Apple CKSyncEngine docs; WWDC23 10188; TN3162 (throttles); Apple forum threads 829402, 771941, 772887; `apple/sample-cloudkit-sync-engine`. Full write-ups live in the Wanderlust repo: `docs/cloudkit-sync-engine.md`, `docs/cloudkit-sync-backlog.md`.
+Apple CKSyncEngine docs; WWDC23 10188; TN3162 (throttles); Apple forum threads 829402, 771941, 772887; `apple/sample-cloudkit-sync-engine`.
