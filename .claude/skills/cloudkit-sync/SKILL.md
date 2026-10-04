@@ -87,4 +87,4 @@ print(len(members), root['needsToFetchDatabaseChanges'])
 
 ## Sources
 
-Apple CKSyncEngine docs; WWDC23 10188; TN3162 (throttles); Apple forum threads 829402, 771941, 772887; `apple/sample-cloudkit-sync-engine`. Full write-ups live in the Wanderlust repo: `docs/cloudkit-sync-engine.md`, `docs/cloudkit-sync-backlog.md`.
+Apple CKSyncEngine docs; WWDC23 10188; TN3162 (throttles); Apple forum threads 829402, 771941, 772887; `apple/sample-cloudkit-sync-engine`.

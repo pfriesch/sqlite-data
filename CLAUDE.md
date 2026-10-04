@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Fork of `pointfreeco/sqlite-data` (`pfriesch/sqlite-data`), used by the Wanderlust iOS app for CloudKit sync.
+Fork of `pointfreeco/sqlite-data` (`pfriesch/sqlite-data`), used by an iOS app for CloudKit sync.
 
 - **No pull requests to pointfreeco/sqlite-data.** Changes live only in this fork.
 - Tests: `swift test` (317 pass). The mock sync engine (`MockSyncEngine`, `MockCloudDatabase`) is not faithful to CloudKit: it never posts `willSendChanges`/`didSendChanges`, takes every pending change in one batch, and rejects 200+ records (real: 250 per engine batch, 400 per request). Behavior that depends on those events (deferred re-queue, throttle resume) can only be verified on a real device.

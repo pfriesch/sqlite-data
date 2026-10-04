@@ -1,6 +1,6 @@
 # CloudKit sync internals: CKSyncEngine, SQLiteData and this fork
 
-_Reference written 2026-10-03/04 from work on a real app (Wanderlust, iPhone 13, iOS 27.0.1, CloudKit Development environment, 190k records) with sqlite-data 1.12.0 plus this fork. Facts are marked **[Apple]** (Apple documentation), **[measured]** (observed on the device), **[forum]** (reported by other developers) or **[assumed]** (not verified). Evidence and day-by-day notes live in the Wanderlust repo (`docs/cloudkit-sync-backlog.md`, `docs/cloudkit-sync-engine.md`), which is not part of this fork. How the test mock differs from all of this: [MockFidelity.md](MockFidelity.md)._
+_Reference written 2026-10-03/04 from work on a real app (iPhone 13, iOS 27.0.1, CloudKit Development environment, 190k records) with sqlite-data 1.12.0 plus this fork. Facts are marked **[Apple]** (Apple documentation), **[measured]** (observed on the device), **[forum]** (reported by other developers) or **[assumed]** (not verified). How the test mock differs from all of this: [MockFidelity.md](MockFidelity.md)._
 
 ## 1. The layers
 
@@ -107,9 +107,9 @@ Code 6 is CloudKit throttling (retry-after 11-76 s), also on plain uploads witho
 
 ## 8. How to investigate (toolkit)
 
-- **Read CloudKit's own log in-process:** `OSLogStore(scope: .currentProcessIdentifier)` with a predicate on subsystem `com.apple.cloudkit` returns the engine's lines (`Engine`, `OP`, `CK`, `Scheduler`), including `failed sending changes`, `scheduling sync with earliest start date` and `Operation ... finished with error ... Retry after N seconds`. No device-log tool needed. Helper: `~/Work/sqlite-data-backup/CKLogDump.swift` (temporary; writes to Library/Caches, copy out with `devicectl device copy from`).
-- **Timing/probe patch** for the fork (batch build / CloudKit / result handling, pending count every 15 s, error codes per sent event): `~/Work/sqlite-data-backup/sync-timing.patch`. Apply with `git apply`, never commit.
-- **Timeline of engine events**: in the fork, a temporary `dbg()` helper that appends lines to `Documents/<file>.txt` from `handleEvent` (`willSendChanges`, `sentRecordZoneChanges` with failure code counts and `inState`, `didSendChanges`, fetches) and `nextRecordZoneChangeBatch` (batch timing). Read it while the app runs: `xcrun devicectl device copy from --domain-type appDataContainer --domain-identifier de.pfriesch.wanderlust --source Documents/<file>.txt ...`. Never commit it.
+- **Read CloudKit's own log in-process:** `OSLogStore(scope: .currentProcessIdentifier)` with a predicate on subsystem `com.apple.cloudkit` returns the engine's lines (`Engine`, `OP`, `CK`, `Scheduler`), including `failed sending changes`, `scheduling sync with earliest start date` and `Operation ... finished with error ... Retry after N seconds`. No device-log tool needed.
+- **Timing/probe patch** for the fork (batch build / CloudKit / result handling, pending count every 15 s, error codes per sent event): a temporary local patch (never commit it).
+- **Timeline of engine events**: in the fork, a temporary `dbg()` helper that appends lines to `Documents/<file>.txt` from `handleEvent` (`willSendChanges`, `sentRecordZoneChanges` with failure code counts and `inState`, `didSendChanges`, fetches) and `nextRecordZoneChangeBatch` (batch timing). Read it while the app runs: `xcrun devicectl device copy from --domain-type appDataContainer --domain-identifier <bundle id> --source Documents/<file>.txt ...`. Never commit it.
 - **Why a send cycle started**: the raw `CKSyncEngine.Event` has `context.reason` (`.scheduled` / `.manual`) and `context.options.scope` (iOS 17.2+).
 - **Engine state**: dump `stateSerialization` (section 4) at `handleStateUpdate`, decode offline.
 - **Run the app with a switch**: `xcrun devicectl device process launch -e '{"NAME":"value"}' ...`.
@@ -130,7 +130,7 @@ What the engine knows that the user cannot see today, and where to get it:
 | "waiting for a good moment" | transient codes (6, 7, 23, 3/4, 9) with no retry-after; Apple: the engine waits for good system conditions |
 | why nothing is happening although changes are pending | derive: pending > 0, not sending, last result and time |
 
-Built: the fork (commit `a2333e7`) exposes `SyncEngine.lastSendOutcome` (observable; `SendOutcome`: date, savedCount, failedCount, errorCodes, retryAfterSeconds, `isThrottled`) and `pendingChangeCount()` (engine state + buffer + overflow table). The app shows one line on the Cloud Sync details screen (`CloudSyncModel.uploadStatusText`, reserved height so nothing shifts): "Last upload 2 min ago: 250 records saved.", "...N saved, M failed (error 14 x M)." or, when throttled, "iCloud asked the app to slow down (asked us to wait 25 s)... The system schedules the retry, which can take several minutes. Sync now retries immediately." A unit test covers the outcome and the pending count (`PendingChangeBoundTests`). Not shown yet: the pending count in the UI (the existing "Unsynced" card is used), and a Settings-row summary.
+Built: the fork (commit `a2333e7`) exposes `SyncEngine.lastSendOutcome` (observable; `SendOutcome`: date, savedCount, failedCount, errorCodes, retryAfterSeconds, `isThrottled`) and `pendingChangeCount()` (engine state + buffer + overflow table). Apps can show a status line from it (reserve its height so nothing shifts), e.g. "Last upload 2 min ago: 250 records saved.", "...N saved, M failed (error 14 x M)." or, when throttled, "iCloud asked the app to slow down (asked us to wait 25 s)... Sync now retries immediately." A unit test covers the outcome and the pending count (`PendingChangeBoundTests`).
 
 ## 10. Open questions
 
@@ -138,7 +138,7 @@ Built: the fork (commit `a2333e7`) exposes `SyncEngine.lastSendOutcome` (observa
 - How long does the engine wait after `serviceUnavailable`? Answered in part: it does not follow the server's retry-after (25 s); it schedules a system activity and stayed silent 12+ minutes in the foreground. How long until iOS runs it is still unknown.
 - Upload speed: 6-13 s per 250 records on the Development environment; Production not measured.
 - The bounded queue is outside the stock design (engine state = whole queue); Apple documents no limit on pending changes, but 40k+ failed for us.
-- Record count: 132k of about 190k records are path points. One compact record per event would cut the load by about 70%, at odds with the typed-columns rule.
+- Record count dominates upload time (about 1,200 records/min is the rough ceiling); packing many small rows into one record cuts the load but is at odds with the typed-columns rule.
 
 ## 11. Measurements (iPhone 13, Development environment)
 
@@ -161,7 +161,7 @@ Built: the fork (commit `a2333e7`) exposes `SyncEngine.lastSendOutcome` (observa
 
 ## Addendum 2026-10-03: why the engine goes quiet after a throttle
 
-After a refused request (`serviceUnavailable` with retry-after, or `partialFailure`) the engine logs `scheduling sync with earliest start date` and hands the retry to the system activity scheduler (no timer). With the app in the foreground it stayed silent for 12+ minutes in two runs while the server's retry-after was 25 s. **Later correction (2026-10-04):** a third run recovered on its own after 32-130 s (the engine's own scheduled retries), so the wait varies from about half a minute to 12+ minutes; what decides it is not known. Evidence, method (reading `com.apple.cloudkit` log lines in-process via `OSLogStore`) and consequences: cloudkit-sync-backlog.md (Wanderlust repo), section "Why the engine goes quiet". Engine requests run at `qos=Utility` through a "container throttle queue".
+After a refused request (`serviceUnavailable` with retry-after, or `partialFailure`) the engine logs `scheduling sync with earliest start date` and hands the retry to the system activity scheduler (no timer). With the app in the foreground it stayed silent for 12+ minutes in two runs while the server's retry-after was 25 s. **Later correction (2026-10-04):** a third run recovered on its own after 32-130 s (the engine's own scheduled retries), so the wait varies from about half a minute to 12+ minutes; what decides it is not known. Engine requests run at `qos=Utility` through a "container throttle queue".
 
 ## Option: resume sending after a throttle (opt-in, off by default)
 
