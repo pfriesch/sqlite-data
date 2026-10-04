@@ -2129,6 +2129,16 @@
       }
     }
 
+    /// True when the record exists locally but the server has never saved it. The stored server
+    /// record is no proof: it is written when the batch is built, before the send.
+    private func isUnsentLocalRecord(_ recordID: CKRecord.ID) async -> Bool {
+      let metadata = try? await metadatabase.read { db in
+        try SyncMetadata.find(recordID).where { !$0._isDeleted }.fetchOne(db)
+      }
+      guard let metadata = metadata ?? nil else { return false }
+      return metadata.lastKnownServerRecord?.hasBeenSavedToServer != true
+    }
+
     package func handleSentRecordZoneChanges(
       savedRecords: [CKRecord] = [],
       failedRecordSaves: [(record: CKRecord, error: CKError)] = [],
@@ -2140,10 +2150,10 @@
 
       var newPendingRecordZoneChanges: [CKSyncEngine.PendingRecordZoneChange] = []
       var newPendingDatabaseChanges: [CKSyncEngine.PendingDatabaseChange] = []
-      var quotaExceededRecordIDs: [CKRecord.ID] = []
+      var delayedRecordIDs: [CKRecord.ID] = []
       defer {
-        if !quotaExceededRecordIDs.isEmpty {
-          let ids = quotaExceededRecordIDs
+        if !delayedRecordIDs.isEmpty {
+          let ids = delayedRecordIDs
           let delay = Self.quotaRetryDelay
           // Detached: see `addDeferredChangesAfterSend`.
           Task.detached {
@@ -2195,6 +2205,17 @@
           await clearServerRecord()
 
         case .referenceViolation:
+          if let parentRecordID = failedRecord.parent?.recordID,
+            await isUnsentLocalRecord(parentRecordID)
+          {
+            // The parent is still local and has never reached the server (it may be waiting out
+            // quotaExceeded), so this is not a remote delete: keep the child and send both again
+            // after the quota delay. The after-send path would retry within a second and fail again.
+            // devmode: a parent that never uploads (rejected for good) is retried every delay; track
+            // attempts if that shows up.
+            delayedRecordIDs += [parentRecordID, failedRecord.recordID]
+            continue
+          }
           guard
             let recordPrimaryKey = failedRecord.recordID.recordPrimaryKey,
             let table = tablesByName[failedRecord.recordType],
@@ -2287,7 +2308,7 @@
         case .quotaExceeded:
           // The engine drops the change on quotaExceeded, so it must be put back. Not through the
           // normal after-send path: that retries within a second and would hammer a full account.
-          quotaExceededRecordIDs.append(failedRecord.recordID)
+          delayedRecordIDs.append(failedRecord.recordID)
 
         case .networkFailure, .networkUnavailable, .zoneBusy, .serviceUnavailable,
           .notAuthenticated, .operationCancelled,

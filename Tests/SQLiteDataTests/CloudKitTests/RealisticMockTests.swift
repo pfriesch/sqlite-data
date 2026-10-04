@@ -362,7 +362,7 @@
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test func quotaExceededSavesAreRequeuedAfterADelayAndThenUpload() async throws {
         SyncEngine.setQuotaRetryDelay(.milliseconds(300))
-        defer { SyncEngine.setQuotaRetryDelay(.seconds(300)) }
+        defer { SyncEngine.setQuotaRetryDelay(.seconds(30)) }
         let database = syncEngine.private.database
         syncEngine.private.state.isRealistic.setValue(true)
         try await seed(2)  // 3 changes

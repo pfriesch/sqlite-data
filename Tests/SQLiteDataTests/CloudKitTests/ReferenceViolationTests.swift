@@ -11,6 +11,50 @@
   extension BaseCloudKitTests {
     @MainActor
     final class ReferenceViolationTests: BaseCloudKitTests, @unchecked Sendable {
+      // * A list fails to save with quotaExceeded, so it waits for the delayed re-queue.
+      // * The quota clears and a reminder is added to that list before the list is re-sent.
+      // * The reminder is rejected with referenceViolation: its parent is not on the server yet.
+      // => The reminder must survive and upload once the list does (upstream #548).
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func addReminderToListThatWasNeverUploaded() async throws {
+        SyncEngine.setQuotaRetryDelay(.milliseconds(300))
+        defer { SyncEngine.setQuotaRetryDelay(.seconds(30)) }
+        let database = syncEngine.private.database
+        syncEngine.private.state.isRealistic.setValue(true)
+
+        database.state.withValue { $0.isQuotaExceeded = true }
+        try await userDatabase.userWrite { db in
+          try db.seed { RemindersList(id: 1, title: "Personal") }
+        }
+        try await syncEngine.runSendCycle(scope: .private)
+        #expect(syncEngine.lastSendOutcome?.isQuotaExceeded == true)
+
+        database.state.withValue { $0.isQuotaExceeded = false }
+        try await userDatabase.userWrite { db in
+          try db.seed { Reminder(id: 1, title: "Get milk", remindersListID: 1) }
+        }
+        try await syncEngine.runSendCycle(scope: .private)
+        #expect(
+          syncEngine.lastSendOutcome?.errorCodes[CKError.Code.referenceViolation.rawValue] == 1
+        )
+
+        try await Task.sleep(for: .seconds(1))  // the list's quota re-queue
+        try await syncEngine.runSendCycle(scope: .private)
+        try await Task.sleep(for: .milliseconds(300))  // deferred re-queues
+        try await syncEngine.runSendCycle(scope: .private)
+
+        try await userDatabase.read { db in
+          try #expect(
+            Reminder.all.fetchAll(db) == [Reminder(id: 1, title: "Get milk", remindersListID: 1)]
+          )
+        }
+        let serverRecordIDs = database.state.withValue {
+          Set($0.storage.values.flatMap { $0.records.keys })
+        }
+        #expect(serverRecordIDs.contains(RemindersList.recordID(for: 1)))
+        #expect(serverRecordIDs.contains(Reminder.recordID(for: 1)))
+      }
+
       // * Local client moves a reminder to a list.
       // * At same time, remote deletes that list.
       // => When data is synchronized the reminder and list are deleted.

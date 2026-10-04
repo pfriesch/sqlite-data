@@ -379,6 +379,11 @@
       get { self[#function] }
       set { self[#function] = newValue }
     }
+
+    /// Only the server assigns a change tag (the mock uses `_recordChangeTag`).
+    package var hasBeenSavedToServer: Bool {
+      recordChangeTag != nil || _recordChangeTag != nil
+    }
   }
 
   extension DataProtocol {
