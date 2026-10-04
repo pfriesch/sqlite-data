@@ -333,6 +333,26 @@
       }
 
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func quotaExceededSavesAreRequeuedAfterADelayAndThenUpload() async throws {
+        SyncEngine.setQuotaRetryDelay(.milliseconds(300))
+        defer { SyncEngine.setQuotaRetryDelay(.seconds(300)) }
+        let database = syncEngine.private.database
+        syncEngine.private.state.isRealistic.setValue(true)
+        try await seed(2)  // 3 changes
+
+        database.state.withValue { $0.isQuotaExceeded = true }
+        try await syncEngine.runSendCycle(scope: .private)
+        #expect(serverRecordCount == 0)
+        #expect(syncEngine.private.state.pendingRecordZoneChanges.isEmpty)  // the engine dropped them
+
+        database.state.withValue { $0.isQuotaExceeded = false }
+        try await Task.sleep(for: .seconds(1))
+        #expect(syncEngine.private.state.pendingRecordZoneChanges.count == 3)  // we put them back
+        try await syncEngine.runSendCycle(scope: .private)
+        #expect(serverRecordCount == 3)
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test func fuzzIsOffByDefaultAndReproducibleBySeed() async throws {
         let database = syncEngine.private.database
         #expect(database.fuzz.value == nil)

@@ -102,7 +102,7 @@ Related gotcha: awaiting a `CKSyncEngine` call from a task created inside a dele
 | 27 | `limitExceeded` | only in tests | more than 400 items or 2 MB of record data in one request (the real engine sends at most 250 records per batch) |
 | 22 | `batchRequestFailed` | no | a failure elsewhere in an atomic batch; library re-queues |
 | 23 | `zoneBusy`, 3/4 network, 9 `notAuthenticated` | no | transient |
-| 25 | `quotaExceeded` | no | **not retried by the engine, and the change leaves its queue [forum/Selig]. This fork's `handleSentRecordZoneChanges` ignores it (`continue`, `SyncEngine.swift` around line 2180), so a save that fails on a full iCloud quota is dropped until something re-enqueues the row. Known gap, not fixed, not tested.** A fix would re-queue after `didSendChanges` with a long wait and surface it in the status UI |
+| 25 | `quotaExceeded` | no | not retried by the engine, and the change leaves its queue [forum/Selig]. The fork re-queues the failed saves 5 minutes later from a detached task (`SyncEngine.quotaRetryDelay`), not through the 100 ms after-send path, so a full account is not hammered. Deletes are not affected. Unit test only (`RealisticMockTests`); not seen on a device |
 
 Code 6 is CloudKit throttling (retry-after 11-76 s), also on plain uploads without any harness; see section 11. **[measured]**
 

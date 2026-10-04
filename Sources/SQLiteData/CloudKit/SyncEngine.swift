@@ -103,6 +103,11 @@
     /// changes only schedules a sync if none is scheduled. See docs/cloudkit-sync-backlog.md.
     private let changesToAddAfterSend = LockIsolated(DeferredChanges())
 
+    /// How long to wait before re-queueing saves that failed with `quotaExceeded`.
+    package static var quotaRetryDelay: Duration { _quotaRetryDelay.withValue { $0 } }
+    package static func setQuotaRetryDelay(_ delay: Duration) { _quotaRetryDelay.withValue { $0 = delay } }
+    private static let _quotaRetryDelay = LockIsolated<Duration>(.seconds(300))
+
     private struct DeferredChanges {
       var database: [CKSyncEngine.PendingDatabaseChange] = []
       var records: [CKSyncEngine.PendingRecordZoneChange] = []
@@ -2112,7 +2117,17 @@
 
       var newPendingRecordZoneChanges: [CKSyncEngine.PendingRecordZoneChange] = []
       var newPendingDatabaseChanges: [CKSyncEngine.PendingDatabaseChange] = []
+      var quotaExceededRecordIDs: [CKRecord.ID] = []
       defer {
+        if !quotaExceededRecordIDs.isEmpty {
+          let ids = quotaExceededRecordIDs
+          let delay = Self.quotaRetryDelay
+          // Detached: see `addDeferredChangesAfterSend`.
+          Task.detached {
+            try? await Task.sleep(for: delay)
+            syncEngine.state.add(pendingRecordZoneChanges: ids.map { .saveRecord($0) })
+          }
+        }
         if (syncEngine as? MockSyncEngine)?.state.isRealistic.value ?? true {
           let database = newPendingDatabaseChanges
           let records = newPendingRecordZoneChanges
@@ -2246,12 +2261,17 @@
           newPendingRecordZoneChanges.append(.saveRecord(failedRecord.recordID))
           break
 
+        case .quotaExceeded:
+          // The engine drops the change on quotaExceeded, so it must be put back. Not through the
+          // normal after-send path: that retries within a second and would hammer a full account.
+          quotaExceededRecordIDs.append(failedRecord.recordID)
+
         case .networkFailure, .networkUnavailable, .zoneBusy, .serviceUnavailable,
           .notAuthenticated, .operationCancelled,
           .internalError, .partialFailure, .badContainer, .requestRateLimited, .missingEntitlement,
           .invalidArguments, .resultsTruncated, .assetFileNotFound,
           .assetFileModified, .incompatibleVersion, .constraintViolation, .changeTokenExpired,
-          .badDatabase, .quotaExceeded, .limitExceeded, .userDeletedZone, .tooManyParticipants,
+          .badDatabase, .limitExceeded, .userDeletedZone, .tooManyParticipants,
           .alreadyShared, .managedAccountRestricted, .participantMayNeedVerification,
           .serverResponseLost, .assetNotAvailable, .accountTemporarilyUnavailable:
           continue
