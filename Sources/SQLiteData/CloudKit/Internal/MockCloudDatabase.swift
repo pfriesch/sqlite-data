@@ -128,6 +128,10 @@
       package var refusalSeconds = 0.4
       /// How long the system scheduler stays quiet after a refusal: 32 s to 12+ min observed.
       package var schedulerWaitSeconds = 60.0
+      /// After a server refusal, requests fail locally with `requestRateLimited` ("rate limited due
+      /// to an earlier error", TN3162) until the retry-after has passed, without reaching the
+      /// server and without using up budget. **[assumed]** that the device behaves like this.
+      package var deviceSideThrottle = true
       /// `nil` never throttles.
       package var throttle: Throttle? = Throttle()
 
@@ -149,6 +153,8 @@
     /// Time the requests made so far would have taken, plus time advanced by tests.
     package let simulatedSeconds = LockIsolated(0.0)
     private let bucket = LockIsolated<(tokens: Double, at: Double)?>(nil)
+    /// Simulated time until which the device refuses requests itself.
+    private let deviceThrottledUntil = LockIsolated(0.0)
 
     /// Random faults for unexpected iCloud behavior, off by default. Reproducible: the same seed
     /// and the same requests give the same faults (see ``fuzzLog``).
@@ -284,10 +290,18 @@
           atomically: atomically
         )
       }
+      let now = simulatedSeconds.value
+      if profile.deviceSideThrottle, now < deviceThrottledUntil.value {
+        throw CKError(
+          .requestRateLimited,
+          userInfo: [CKErrorRetryAfterKey: (deviceThrottledUntil.value - now).rounded(.up)]
+        )
+      }
       if let error = throttleError(
         forRecords: recordsToSave.count + recordIDsToDelete.count, profile: profile
       ) {
         advanceSimulatedTime(by: profile.refusalSeconds)
+        deviceThrottledUntil.setValue(simulatedSeconds.value + (error.retryAfterSeconds ?? 0))
         throw error
       }
       let results = try applyModifyRecords(

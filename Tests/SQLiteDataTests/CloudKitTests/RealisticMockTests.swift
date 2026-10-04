@@ -148,6 +148,32 @@
         #expect(serverRecordCount == 1_500)
       }
 
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func afterAServerRefusalTheDeviceRefusesLocallyWithCode7UntilTheRetryAfter() async throws {
+        let database = syncEngine.private.database
+        let zoneID = try #require(database.state.withValue { $0.storage.keys.first })
+        database.profile.setValue(.measured)
+        func records(_ prefix: String) -> [CKRecord] {
+          (0..<400).map { CKRecord(recordType: "T", recordID: .init(recordName: "\(prefix)\($0)", zoneID: zoneID)) }
+        }
+        func refusal(_ prefix: String) -> CKError? {
+          do { _ = try database.modifyRecords(saving: records(prefix)); return nil }
+          catch { return error as? CKError }
+        }
+        #expect(refusal("a") == nil)
+        #expect(refusal("b") == nil)
+        let server = try #require(refusal("c"))  // burst of 1,000 is used up
+        #expect(server.code == .serviceUnavailable)
+        let retryAfter = try #require(server.retryAfterSeconds)
+
+        let local = try #require(refusal("d"))
+        #expect(local.code == .requestRateLimited)
+        #expect((local.retryAfterSeconds ?? .infinity) <= retryAfter)
+
+        database.advanceSimulatedTime(by: retryAfter)
+        #expect(refusal("e") == nil)
+      }
+
       // MARK: resumesSendingAfterThrottle
 
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
@@ -320,6 +346,7 @@
         database.state.withValue { $0.isQuotaExceeded = true }
         try await syncEngine.runSendCycle(scope: .private)
         #expect(syncEngine.lastSendOutcome?.errorCodes[CKError.Code.quotaExceeded.rawValue] == 3)
+        #expect(syncEngine.lastSendOutcome?.isQuotaExceeded == true)
 
         database.state.withValue { $0.isQuotaExceeded = false; $0.userDeletedZones = [zoneID] }
         syncEngine.private.state.add(pendingRecordZoneChanges: [.saveRecord(Reminder.recordID(for: 1))])

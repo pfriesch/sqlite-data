@@ -61,6 +61,7 @@ print(len(members), root['needsToFetchDatabaseChanges'])
 | 14 | `serverRecordChanged` | Not retried by the engine. Library merges, re-queues after `didSendChanges`. Natural cause: server has the record but metadata lacks the change tag (lost ack, or queue rebuilt from metadata). "record to insert already exists" |
 | 6 | `serviceUnavailable` | transient, throttle; see above |
 | 7 | `requestRateLimited` | transient, honors retry-after |
+| 25 | `quotaExceeded` | Engine drops the change. Fork re-queues saves after `quotaRetryDelay` (30 s, guess); deletes fine. `SendOutcome.isQuotaExceeded` |
 | 27 | `limitExceeded` | more than 400 items / 2 MB per request |
 | 22 | `batchRequestFailed` | failure elsewhere in an atomic batch; re-queued |
 | 23/3/4/9 | `zoneBusy`, network, `notAuthenticated` | transient |

@@ -104,9 +104,14 @@
     private let changesToAddAfterSend = LockIsolated(DeferredChanges())
 
     /// How long to wait before re-queueing saves that failed with `quotaExceeded`.
+    ///
+    /// A guess, not a measurement: Apple documents no retry interval for a full quota (the user has
+    /// to free space or buy more), so this only has to be long enough not to hammer CloudKit and
+    /// short enough to recover soon after the user acts. Raise it for a shipping app if the status
+    /// UI shows ``SendOutcome/isQuotaExceeded`` and offers "sync now" instead.
     package static var quotaRetryDelay: Duration { _quotaRetryDelay.withValue { $0 } }
     package static func setQuotaRetryDelay(_ delay: Duration) { _quotaRetryDelay.withValue { $0 = delay } }
-    private static let _quotaRetryDelay = LockIsolated<Duration>(.seconds(300))
+    private static let _quotaRetryDelay = LockIsolated<Duration>(.seconds(30))
 
     private struct DeferredChanges {
       var database: [CKSyncEngine.PendingDatabaseChange] = []
@@ -512,6 +517,13 @@
       public var errorCodes: [Int: Int]
       /// How long CloudKit asked the app to wait, if it said so (throttles).
       public var retryAfterSeconds: Double?
+
+      /// True when saves failed with `quotaExceeded`: the user's iCloud storage is full (Apple: ask
+      /// them to manage storage in iCloud settings; in a shared zone it is the owner's quota).
+      /// The failed saves are re-queued automatically, see ``SyncEngine/quotaRetryDelay``.
+      public var isQuotaExceeded: Bool {
+        errorCodes[CKError.Code.quotaExceeded.rawValue] != nil
+      }
 
       /// True when CloudKit refused the request because of load: `serviceUnavailable` or
       /// `requestRateLimited`. `CKSyncEngine` then waits for the system to schedule a retry,
