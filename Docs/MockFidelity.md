@@ -45,7 +45,10 @@ Done, tested in `RealisticMockTests`: steps 1-4 of the design, in part.
 - Scheduling: `isSendScheduled` is set only by changes added outside a cycle; `runScheduledSend(scope:)` runs it. The `f0e8fb5` regression test fails when the deferral is reverted (checked).
 - Injection: `database.failNextRequests(_:with:)`, `CKError.throttled(retryAfter:)`; a refused request fails every record, which stays pending, and the engine waits until `advanceScheduler()` or a manual `sendChanges()`.
 - Mock no longer removes saves from pending when it builds a batch (deviation 6, partly).
-- Not done: `stateUpdate` events with a serialization (items 1 and 8), in-flight tracking, a test for `resumesSendingAfterThrottle` (its minimum delay is 5 s of real time), steps 5-7.
+- Opt-in `MockSyncEngineState.stateBytesPerPendingChange`: posts `stateUpdate` with a stand-in serialization (about that many stored bytes per pending change; 375 on device), so `SyncEngine.restoredState` and its 16 MB guard run for real.
+- Opt-in `MockCloudDatabase.profile` (`.measuredDevelopment`): simulated time per request (8.4 ms per record, x2.01 for a record with `parent`, i.e. `tables:` vs `privateTables:`), a token-bucket throttle (1,000 burst, 20 records/s), refusal latency, and the scheduler wait. Time is simulated (`simulatedSeconds`), never slept. Unmeasured and left at 1: Production vs Development speed (`environmentMultiplier`), record size (3 KB did not matter), assets, shared database, several zones, `atomicByZone`.
+- `SyncEngine.throttleClock` lets tests drive `resumesSendingAfterThrottle` with a `TestClock`.
+- Not done: in-flight tracking, steps 5-7.
 
 ## Order of work and risk
 

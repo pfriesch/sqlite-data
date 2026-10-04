@@ -104,7 +104,103 @@
       return results
     }
 
+    /// What a request costs and when the server refuses it, so a workload run through the mock
+    /// reports the time and throttling the real service would show for the same configuration.
+    ///
+    /// Time is *simulated*: it only advances through ``simulatedSeconds``, never by sleeping, so
+    /// runs stay fast and deterministic. Numbers are from the iPhone measurements in
+    /// `Docs/CloudKitSyncInternals.md` (Development environment). Only what was measured is
+    /// modeled; everything else is a knob left at 1.
+    package struct Profile: Sendable {
+      /// Raw `modifyRecords` time per record: 2.10 s per 250 records without `parent`.
+      package var secondsPerRecord = 2.10 / 250
+      /// A record with `record.parent` (tables registered with `tables:`, not `privateTables:`)
+      /// takes this many times longer: 4.22 s vs 2.10 s per 250 records.
+      package var parentMultiplier = 4.22 / 2.10
+      /// Production vs Development speed is not measured; Development is the slower one.
+      package var environmentMultiplier = 1.0
+      /// A refused request returns in 0.3-0.5 s.
+      package var refusalSeconds = 0.4
+      /// How long the system scheduler stays quiet after a refusal: 32 s to 12+ min observed.
+      package var schedulerWaitSeconds = 60.0
+      /// `nil` never throttles.
+      package var throttle: Throttle? = Throttle()
+
+      /// Token bucket over records. The server tripped at about 750-1,750 records within 20-40 s
+      /// and passed about 1,200 records/min; retry-after was 11-76 s.
+      package struct Throttle: Sendable {
+        package var burstRecords = 1_000.0
+        package var recordsPerSecond = 20.0
+        package var minimumRetryAfterSeconds = 11.0
+        package init() {}
+      }
+
+      package static let measuredDevelopment = Profile()
+      package init() {}
+    }
+
+    /// `nil` (the default) makes requests instant and never throttles.
+    package let profile = LockIsolated<Profile?>(nil)
+    /// Time the requests made so far would have taken, plus time advanced by tests.
+    package let simulatedSeconds = LockIsolated(0.0)
+    private let bucket = LockIsolated<(tokens: Double, at: Double)?>(nil)
+
+    package func advanceSimulatedTime(by seconds: Double) {
+      simulatedSeconds.withValue { $0 += seconds }
+    }
+
+    private func throttleError(forRecords count: Int, profile: Profile) -> CKError? {
+      guard let throttle = profile.throttle else { return nil }
+      let now = simulatedSeconds.value
+      return bucket.withValue { bucket in
+        let previous = bucket ?? (throttle.burstRecords, now)
+        let tokens = min(
+          throttle.burstRecords,
+          previous.tokens + (now - previous.at) * throttle.recordsPerSecond
+        )
+        if tokens >= Double(count) {
+          bucket = (tokens - Double(count), now)
+          return nil
+        }
+        bucket = (tokens, now)
+        let wait = (Double(count) - tokens) / throttle.recordsPerSecond
+        return .throttled(retryAfter: max(wait, throttle.minimumRetryAfterSeconds).rounded(.up))
+      }
+    }
+
     package func modifyRecords(
+      saving recordsToSave: [CKRecord] = [],
+      deleting recordIDsToDelete: [CKRecord.ID] = [],
+      savePolicy: CKModifyRecordsOperation.RecordSavePolicy = .ifServerRecordUnchanged,
+      atomically: Bool = true
+    ) throws -> (
+      saveResults: [CKRecord.ID: Result<CKRecord, any Error>],
+      deleteResults: [CKRecord.ID: Result<Void, any Error>]
+    ) {
+      guard let profile = profile.value
+      else {
+        return try applyModifyRecords(
+          saving: recordsToSave, deleting: recordIDsToDelete, savePolicy: savePolicy,
+          atomically: atomically
+        )
+      }
+      if let error = throttleError(
+        forRecords: recordsToSave.count + recordIDsToDelete.count, profile: profile
+      ) {
+        advanceSimulatedTime(by: profile.refusalSeconds)
+        throw error
+      }
+      let results = try applyModifyRecords(
+        saving: recordsToSave, deleting: recordIDsToDelete, savePolicy: savePolicy,
+        atomically: atomically
+      )
+      let weight = recordsToSave.reduce(0.0) { $0 + ($1.parent == nil ? 1 : profile.parentMultiplier) }
+        + Double(recordIDsToDelete.count)
+      advanceSimulatedTime(by: weight * profile.secondsPerRecord * profile.environmentMultiplier)
+      return results
+    }
+
+    private func applyModifyRecords(
       saving recordsToSave: [CKRecord] = [],
       deleting recordIDsToDelete: [CKRecord.ID] = [],
       savePolicy: CKModifyRecordsOperation.RecordSavePolicy = .ifServerRecordUnchanged,

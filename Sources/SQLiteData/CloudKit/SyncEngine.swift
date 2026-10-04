@@ -60,7 +60,7 @@
     package static let maxRestorableStateBytes = 16_000_000
     package let needsPendingRebuild = LockIsolated(false)
 
-    private static func restoredState(
+    package static func restoredState(
       isPrivate: Bool,
       metadatabase: any DatabaseReader,
       syncEngine: SyncEngine
@@ -559,6 +559,8 @@
     }
     private let _resumesSendingAfterThrottle = LockIsolated(false)
     private let resumeAfterThrottleTask = LockIsolated<Task<Void, Never>?>(nil)
+    /// The clock the wait before resuming runs on; tests replace it to avoid real waiting.
+    package let throttleClock = LockIsolated<any Clock<Duration>>(ContinuousClock())
 
     private func scheduleResumeAfterThrottle(retryAfterSeconds: Double?) {
       guard resumesSendingAfterThrottle else { return }
@@ -567,8 +569,9 @@
       resumeAfterThrottleTask.withValue {
         $0?.cancel()
         // Detached: awaiting a CKSyncEngine call from a task created inside a delegate callback traps.
+        let clock = throttleClock.value
         $0 = Task.detached { [weak self] in
-          try? await Task.sleep(for: .seconds(delay))
+          try? await clock.sleep(for: .seconds(delay))
           guard !Task.isCancelled, let self,
             let engine = self.syncEngines.withValue({ $0.private })
           else { return }

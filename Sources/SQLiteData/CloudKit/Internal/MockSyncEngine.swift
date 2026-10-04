@@ -84,7 +84,13 @@
     }
 
     /// Lets the system scheduler fire after a transient refusal, scheduling a send if work is left.
+    ///
+    /// With a ``MockCloudDatabase/Profile`` the simulated clock advances by its
+    /// `schedulerWaitSeconds`, so the throttle bucket refills.
     package func advanceScheduler() {
+      if let profile = database.profile.value {
+        database.advanceSimulatedTime(by: profile.schedulerWaitSeconds)
+      }
       state.isSchedulerWaiting.setValue(false)
       if !state.pendingRecordZoneChanges.isEmpty { state.isSendScheduled.setValue(true) }
     }
@@ -156,6 +162,12 @@
     /// default so tests that drive one batch by hand keep working.
     package let isRealistic = LockIsolated(false)
     package let isSendCycleRunning = LockIsolated(false)
+    /// Opt-in: post `stateUpdate` events during a send cycle, with a serialization whose size
+    /// grows with the pending changes (about 375 bytes each; 45 MB at 120k changes on device).
+    /// The serialization is a stand-in (JSON around a property list) that the library stores
+    /// and restores like the real one, so `restoredState` and its 16 MB guard run for real.
+    /// `nil` posts none.
+    package let stateBytesPerPendingChange = LockIsolated<Int?>(nil)
     /// Set when changes are added outside a send cycle (the real engine then schedules a send);
     /// consumed by ``SyncEngine/runScheduledSend(scope:)``.
     package let isSendScheduled = LockIsolated(false)
@@ -402,16 +414,45 @@
       state.isSendScheduled.setValue(false)
 
       await handleEvent(.willSendChanges, syncEngine: engine)
+      await postStateUpdate(engine)
       while !state.pendingRecordZoneChanges.isEmpty {
         let callback = try await sendPendingRecordZoneChanges(scope: scope)
         guard callback.didSend else { break }
         await callback.receive()
+        await postStateUpdate(engine)
         if callback.hadFailures {
           if callback.wholeRequestError != nil { state.isSchedulerWaiting.setValue(true) }
           break
         }
       }
       await handleEvent(.didSendChanges, syncEngine: engine)
+      await postStateUpdate(engine)
+    }
+
+    private func postStateUpdate(_ engine: MockSyncEngine) async {
+      guard let bytes = engine.state.stateBytesPerPendingChange.value else { return }
+      let changes = engine.state.pendingRecordZoneChanges.map { change -> [String: Any] in
+        switch change {
+        case .saveRecord(let id): ["type": 0, "recordName": id.recordName]
+        case .deleteRecord(let id): ["type": 1, "recordName": id.recordName]
+        @unknown default: [:]
+        }
+      }
+      // NB: Base64 in the stored JSON adds a third; pad so the stored size is about `bytes` each.
+      let padding = Data(count: max(bytes * 3 / 4 - 40, 0))
+      let plist = ["pendingRecordModifications": changes.map { $0.merging(["pad": padding]) { $1 }}]
+      guard
+        let data = try? PropertyListSerialization.data(
+          fromPropertyList: plist, format: .binary, options: 0),
+        let json = try? JSONSerialization.data(
+          withJSONObject: ["data": data.base64EncodedString()]),
+        let serialization = try? JSONDecoder().decode(
+          CKSyncEngine.State.Serialization.self, from: json)
+      else {
+        reportIssue("Could not build a state serialization.")
+        return
+      }
+      await handleEvent(.stateUpdate(stateSerialization: serialization), syncEngine: engine)
     }
 
     /// Runs the send the real engine would have scheduled, if there is one. Returns whether it ran.
