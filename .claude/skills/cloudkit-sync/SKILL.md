@@ -34,6 +34,8 @@ app → `SyncEngine` (this repo: triggers, metadata DB, record building, conflic
 3. **Engine idle after a failed batch.** Re-queueing with `state.add` inside the `sentRecordZoneChanges` callback leaves the engine silent (state: `needsToFetchDatabaseChanges = true`, changes pending) for minutes until relaunch or manual `sendChanges()`. Same as Apple forum thread 829402. Fix: hold failed changes and add them after `didSendChanges` from `Task.detached` (~300 ms later the engine fetches and sends within a second). Do not use a restart watchdog.
 4. **Awaiting CKSyncEngine inside a delegate callback traps** ("BUG IN CLIENT OF CLOUDKIT"): the Task inherits CloudKit's task-local. Use `Task.detached`.
 
+5. **A whole-table `UPDATE` blocks the app's database.** Start (new synced table) and sign-in queued every row in one write transaction; on a large table it held the writer for minutes, and in GRDB each new `ValueObservation` keeps a pool reader until it gets the writer, so the app ran out of readers. Fix: `touchRows`, 1,000 rows per transaction (keyset on primary key / rowid). Never queue a whole table in one write.
+
 ## Throttling and the engine going quiet [measured]
 
 - CloudKit throttles by request rate over a window: ~750-1,750 records within 20-40 s trips it; roughly under 1,200 records/min passes (20 requests of 250 paced 12-15 s apart were never throttled; the engine's 5-7 s cadence is refused after 3-13 batches).

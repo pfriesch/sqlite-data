@@ -14,6 +14,7 @@ Fork of `pointfreeco/sqlite-data` (`pfriesch/sqlite-data`), used by an iOS app f
 | `f0e8fb5` | Failed changes are re-queued after `didSendChanges`, from a detached task, not inside `sentRecordZoneChanges` |
 | `a2333e7` | Public `lastSendOutcome` and `pendingChangeCount()` for status UI |
 | `5726285` | `nextRecordZoneChangeBatch` prefetches metadata and rows for the first 250 changes and writes last-known server records once per batch (was per record); not timed on a device |
+| "Queue whole tables in short write transactions" | `touchRows`: queueing a new table (start) or unknown records (sign-in) runs in 1,000-row write transactions instead of one; the single transaction stalled the app behind the writer |
 | `613a056` | Opt-in `resumesSendingAfterThrottle` (default off; measured harmful) |
 
 A watchdog that restarted the engine when idle (`3f5cb14`) was reverted (`7fb3fa6`). Do not bring it back: it hid the cause.

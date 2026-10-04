@@ -828,6 +828,44 @@
         }
       }
 
+      /// A new table is queued for upload in several short transactions; all rows still make it.
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func newTableLargerThanOneTouchBatch() async throws {
+        syncEngine.stop()
+        let rowCount = SyncEngine.touchBatchSize * 2 + 500
+        try await userDatabase.userWrite { db in
+          try #sql(
+            """
+            CREATE TABLE "images" (
+              "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+              "caption" TEXT NOT NULL,
+              "image" BLOB NOT NULL
+            )
+            """
+          )
+          .execute(db)
+          for id in 1...rowCount {
+            try db.execute(
+              sql: #"INSERT INTO "images" ("id", "caption", "image") VALUES (?, '', X'')"#,
+              arguments: [id]
+            )
+          }
+        }
+
+        let relaunchedSyncEngine = try await SyncEngine(
+          container: syncEngine.container,
+          userDatabase: syncEngine.userDatabase,
+          tables: syncEngine.tables + [SynchronizedTable(for: Image.self)],
+          privateTables: syncEngine.privateTables
+        )
+        defer { _ = relaunchedSyncEngine }
+
+        let queued = try await relaunchedSyncEngine.metadatabase.read { db in
+          try SyncMetadata.where { $0.recordType.eq("images") }.fetchCount(db)
+        }
+        #expect(queued == rowCount)
+      }
+
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test func newTable() async throws {
         try await withDependencies {

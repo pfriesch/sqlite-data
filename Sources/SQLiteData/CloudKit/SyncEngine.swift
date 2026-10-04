@@ -90,6 +90,8 @@
     package static let defaultMaxInMemoryPendingChanges = 1_000
     /// Per instance so tests can use a small bound (the mock server rejects batches of 200+).
     package let maxInMemoryPendingChanges = LockIsolated(SyncEngine.defaultMaxInMemoryPendingChanges)
+    /// Rows per write transaction when queueing a whole table for upload (see `touchRows`).
+    package static let touchBatchSize = 1_000
     private let pendingBudget = LockIsolated(PendingBudget())
 
     /// Changes to add to the engine once the current send operation has ended.
@@ -829,16 +831,13 @@
         try PendingRecordZoneChange.count().fetchOne(db) ?? 0
       } > 0
       pendingBudget.withValue { $0.isOverflowing = hasQueuedChanges }
-      try await userDatabase.write { db in
-        let newTableNames = currentRecordTypeByTableName.keys.filter { tableName in
-          previousRecordTypeByTableName[tableName] == nil
+      for tableName in currentRecordTypeByTableName.keys
+      where previousRecordTypeByTableName[tableName] == nil {
+        guard let table = tablesByName[tableName] else { continue }
+        func open<T>(_ table: some SynchronizableTable<T>) async throws {
+          try await touchRows(table: T.tableName, set: T.primaryKey.name, key: T.primaryKey.name)
         }
-
-        try $_isSynchronizingChanges.withValue(false) {
-          for tableName in newTableNames {
-            try self.uploadRecordsToCloudKit(tableName: tableName, db: db)
-          }
-        }
+        try await open(table)
       }
       await topUpPendingChanges()
     }
@@ -1059,36 +1058,48 @@
     }
 
     private func enqueueUnknownRecordsForCloudKit() async throws {
-      try await userDatabase.write { db in
-        try $_isSynchronizingChanges.withValue(false) {
-          try SyncMetadata
-            .where { !$0.hasLastKnownServerRecord }
-            .update { $0.recordPrimaryKey = $0.recordPrimaryKey }
-            .execute(db)
-        }
-      }
-    }
-
-    private func uploadRecordsToCloudKit<T>(
-      table: some SynchronizableTable<T>,
-      db: Database
-    ) throws {
-      // try T.update { $0.primaryKey = $0.primaryKey }.execute(db)
-      try #sql(
-        """
-        UPDATE \(T.self) SET \(quote: T.primaryKey.name) = \(quote: T.primaryKey.name)
-        """
+      try await touchRows(
+        table: SyncMetadata.tableName,
+        set: "recordPrimaryKey",
+        key: "rowid",
+        where: #""hasLastKnownServerRecord" = 0"#
       )
-      .execute(db)
     }
 
-    private func uploadRecordsToCloudKit(tableName: String, db: Database) throws {
-      guard let table = self.tablesByName[tableName]
-      else { return }
-      func open<T>(_ table: some SynchronizableTable<T>) throws {
-        try uploadRecordsToCloudKit(table: table, db: db)
-      }
-      try open(table)
+    /// `UPDATE table SET column = column` over the matching rows, so the triggers queue them
+    /// for upload. Runs as many short write transactions (`touchBatchSize` rows each), never
+    /// one: a single transaction over a large table held the writer for minutes, and every app
+    /// write and every new GRDB observation (which holds a reader until it gets the writer)
+    /// waited behind it. Stopping midway is safe: callers redo the whole set on the next start.
+    private func touchRows(
+      table: String,
+      set column: String,
+      key: String,
+      where filter: String = "1"
+    ) async throws {
+      let (table, column, key) = (
+        table.quotedDatabaseIdentifier, column.quotedDatabaseIdentifier,
+        key.quotedDatabaseIdentifier
+      )
+      let batchSize = Self.touchBatchSize
+      var last: DatabaseValue?
+      repeat {
+        last = try await userDatabase.write { [last] db in
+          let arguments: StatementArguments = last.map { [$0] } ?? []
+          let batch = """
+            SELECT \(key) FROM \(table) WHERE (\(filter)) \(last == nil ? "" : "AND \(key) > ?")
+            ORDER BY \(key) LIMIT \(batchSize)
+            """
+          let keys = try DatabaseValue.fetchAll(db, sql: batch, arguments: arguments)
+          try $_isSynchronizingChanges.withValue(false) {
+            try db.execute(
+              sql: "UPDATE \(table) SET \(column) = \(column) WHERE \(key) IN (\(batch))",
+              arguments: arguments
+            )
+          }
+          return keys.count == batchSize ? keys.last : nil
+        }
+      } while last != nil
     }
 
     private func updateLocalFromSchemaChange(
