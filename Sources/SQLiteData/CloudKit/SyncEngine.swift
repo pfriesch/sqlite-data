@@ -111,9 +111,7 @@
     /// to free space or buy more), so this only has to be long enough not to hammer CloudKit and
     /// short enough to recover soon after the user acts. Raise it for a shipping app if the status
     /// UI shows ``SendOutcome/isQuotaExceeded`` and offers "sync now" instead.
-    package static var quotaRetryDelay: Duration { _quotaRetryDelay.withValue { $0 } }
-    package static func setQuotaRetryDelay(_ delay: Duration) { _quotaRetryDelay.withValue { $0 = delay } }
-    private static let _quotaRetryDelay = LockIsolated<Duration>(.seconds(30))
+    package let quotaRetryDelay = LockIsolated<Duration>(.seconds(30))
 
     private struct DeferredChanges {
       var database: [CKSyncEngine.PendingDatabaseChange] = []
@@ -994,8 +992,9 @@
     }
 
     /// Rebuilds the upload queue after an oversized saved state was dropped: every record that has
-    /// no server copy yet needs a save, every tombstone with one needs a delete. Metadata rows
-    /// without a server record carry no blobs, so this is cheap except for the tombstone check.
+    /// no server copy yet or was re-inserted needs a save, every tombstone with one needs a delete.
+    /// Metadata rows without a server record carry no blobs, so this is cheap except for the
+    /// tombstone check.
     private func rebuildPendingChangesFromMetadata() async throws {
       guard needsPendingRebuild.value else { return }
       try await userDatabase.write { db in try PendingRecordZoneChange.delete().execute(db) }
@@ -1008,11 +1007,13 @@
             try Row.fetchAll(
               db,
               sql: """
-                SELECT rowid, "recordName", "zoneName", "ownerName", "_isDeleted"
+                SELECT rowid, "recordName", "zoneName", "ownerName",
+                  "_pendingStatus" IS 0 AS "isDeleted"
                 FROM "sqlitedata_icloud_metadata"
                 WHERE rowid > ?
-                  AND ((NOT "hasLastKnownServerRecord" AND NOT "_isDeleted")
-                    OR ("_isDeleted" AND "hasLastKnownServerRecord"))
+                  AND (("_pendingStatus" IS NULL AND NOT "hasLastKnownServerRecord")
+                    OR "_pendingStatus" IS 1
+                    OR ("_pendingStatus" IS 0 AND "hasLastKnownServerRecord"))
                 ORDER BY rowid LIMIT 2000
                 """,
               arguments: [after]
@@ -1021,7 +1022,7 @@
                 recordName: row["recordName"],
                 zoneID: CKRecordZone.ID(zoneName: row["zoneName"], ownerName: row["ownerName"])
               )
-              let isDeleted: Bool = row["_isDeleted"]
+              let isDeleted: Bool = row["isDeleted"]
               return (row["rowid"], isDeleted ? .deleteRecord(id) : .saveRecord(id))
             }
           }
@@ -1542,6 +1543,7 @@
         }
       )
       let refreshedRecords = LockIsolated<[CKRecord]>([])
+      let reinsertedRecordIDs = LockIsolated<[CKRecord.ID]>([])
       let batch = await syncEngine.recordZoneChangeBatch(pendingChanges: changes) { recordID in
         guard
           let (metadata, allFields) = prefetch.covered.contains(recordID)
@@ -1621,8 +1623,11 @@
             return nil
           }
 
+          // NB: A re-inserted row starts from the system fields only, so none of the deleted row's
+          //     values go up with it.
+          let isReinserted = metadata._pendingStatus == .reinserted
           let record =
-            allFields
+            (isReinserted ? metadata.lastKnownServerRecord : allFields)
             ?? CKRecord(
               recordType: metadata.recordType,
               recordID: recordID
@@ -1646,12 +1651,16 @@
             userModificationTime: metadata.userModificationTime
           )
           refreshedRecords.withValue { $0.append(record) }
+          if isReinserted { reinsertedRecordIDs.withValue { $0.append(recordID) } }
           sentRecord = recordID
           return record
         }
         return await open(table)
       }
-      await refreshLastKnownServerRecords(refreshedRecords.withValue(\.self))
+      await refreshLastKnownServerRecords(
+        refreshedRecords.withValue(\.self),
+        clearingReinserted: reinsertedRecordIDs.withValue(\.self)
+      )
       return batch
     }
 
@@ -1803,15 +1812,37 @@
         }
       }
 
-      await withErrorReporting(.sqliteDataCloudKitFailure) {
-        guard !deletedRecordIDs.isEmpty
-        else { return }
-        try await userDatabase.write { db in
-          try SyncMetadata
-            .findAll(deletedRecordIDs)
-            .delete()
-            .execute(db)
-        }
+      // NB: A delete whose row was inserted again before it went out is stale: drop it and keep the
+      //     metadata its pending save needs. Does not rely on the engine (or the overflow table)
+      //     letting the later save replace the delete.
+      let staleDeletes: [CKSyncEngine.PendingRecordZoneChange] =
+        await withErrorReporting(.sqliteDataCloudKitFailure) {
+          guard !deletedRecordIDs.isEmpty
+          else { return [] }
+          return try await userDatabase.write { db in
+            let stale = try SyncMetadata
+              .findAll(deletedRecordIDs)
+              .where { $0._pendingStatus.is(nil) || $0._pendingStatus.neq(PendingStatus.deleted) }
+              .select { ($0.recordName, $0.zoneName, $0.ownerName) }
+              .fetchAll(db)
+            try SyncMetadata
+              .findAll(deletedRecordIDs)
+              .where { $0._pendingStatus.eq(PendingStatus.deleted) }
+              .delete()
+              .execute(db)
+            return stale.map { recordName, zoneName, ownerName in
+              .deleteRecord(
+                CKRecord.ID(
+                  recordName: recordName,
+                  zoneID: CKRecordZone.ID(zoneName: zoneName, ownerName: ownerName)
+                )
+              )
+            }
+          }
+        } ?? []
+      if !staleDeletes.isEmpty {
+        changes.removeAll(where: staleDeletes.contains)
+        syncEngine.state.remove(pendingRecordZoneChanges: staleDeletes)
       }
 
       return changes
@@ -2133,7 +2164,10 @@
     /// record is no proof: it is written when the batch is built, before the send.
     private func isUnsentLocalRecord(_ recordID: CKRecord.ID) async -> Bool {
       let metadata = try? await metadatabase.read { db in
-        try SyncMetadata.find(recordID).where { !$0._isDeleted }.fetchOne(db)
+        try SyncMetadata
+          .find(recordID)
+          .where { $0._pendingStatus.is(nil) || $0._pendingStatus.neq(PendingStatus.deleted) }
+          .fetchOne(db)
       }
       guard let metadata = metadata ?? nil else { return false }
       return metadata.lastKnownServerRecord?.hasBeenSavedToServer != true
@@ -2154,7 +2188,7 @@
       defer {
         if !delayedRecordIDs.isEmpty {
           let ids = delayedRecordIDs
-          let delay = Self.quotaRetryDelay
+          let delay = quotaRetryDelay.value
           // Detached: see `addDeferredChangesAfterSend`.
           Task.detached {
             try? await Task.sleep(for: delay)
@@ -2476,10 +2510,19 @@
 
         func open<T>(_ table: some SynchronizableTable<T>) throws {
           var columnNames: [String] = T.TableColumns.writableColumns.map(\.name)
+          let isReinserted = metadata._pendingStatus == .reinserted
           if !force,
-            let allFields = metadata._lastKnownServerRecordAllFields,
+            let allFields = isReinserted
+              ? metadata.lastKnownServerRecord : metadata._lastKnownServerRecordAllFields,
             let row = try T.unscoped.find(#sql("\(bind: metadata.recordPrimaryKey)")).fetchOne(db)
           {
+            // NB: The re-inserted row is newer than anything the server has: its values win.
+            if isReinserted {
+              allFields.update(
+                with: T(queryOutput: row),
+                userModificationTime: metadata.userModificationTime
+              )
+            }
             serverRecord.update(
               with: allFields,
               row: T(queryOutput: row),
@@ -2497,7 +2540,10 @@
             try UnsyncedRecordID.find(serverRecord.recordID).delete().execute(db)
             try SyncMetadata
               .find(serverRecord.recordID)
-              .update { $0.setLastKnownServerRecord(serverRecord) }
+              .update {
+                $0.setLastKnownServerRecord(serverRecord)
+                if isReinserted { $0._pendingStatus = #bind(nil) }
+              }
               .execute(db)
           } catch {
             guard
@@ -2518,10 +2564,20 @@
       }
     }
 
-    private func refreshLastKnownServerRecords(_ records: [CKRecord]) async {
+    private func refreshLastKnownServerRecords(
+      _ records: [CKRecord],
+      clearingReinserted reinsertedRecordIDs: [CKRecord.ID] = []
+    ) async {
       guard !records.isEmpty else { return }
       await withErrorReporting(.sqliteDataCloudKitFailure) {
         try await userDatabase.write { db in
+          if !reinsertedRecordIDs.isEmpty {
+            try SyncMetadata
+              .findAll(reinsertedRecordIDs)
+              .where { $0._pendingStatus.eq(PendingStatus.reinserted) }
+              .update { $0._pendingStatus = #bind(nil) }
+              .execute(db)
+          }
           for record in records {
             let metadata = try SyncMetadata.find(record.recordID).fetchOne(db)
             func updateLastKnownServerRecord() throws {

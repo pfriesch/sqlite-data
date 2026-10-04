@@ -17,8 +17,8 @@
       // => The reminder must survive and upload once the list does (upstream #548).
       @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
       @Test func addReminderToListThatWasNeverUploaded() async throws {
-        SyncEngine.setQuotaRetryDelay(.milliseconds(300))
-        defer { SyncEngine.setQuotaRetryDelay(.seconds(30)) }
+        // NB: Long enough that the list is still waiting when the reminder goes out, even under load.
+        syncEngine.quotaRetryDelay.setValue(.seconds(2))
         let database = syncEngine.private.database
         syncEngine.private.state.isRealistic.setValue(true)
 
@@ -38,7 +38,7 @@
           syncEngine.lastSendOutcome?.errorCodes[CKError.Code.referenceViolation.rawValue] == 1
         )
 
-        try await Task.sleep(for: .seconds(1))  // the list's quota re-queue
+        try await Task.sleep(for: .seconds(3))  // the list's quota re-queue
         try await syncEngine.runSendCycle(scope: .private)
         try await Task.sleep(for: .milliseconds(300))  // deferred re-queues
         try await syncEngine.runSendCycle(scope: .private)

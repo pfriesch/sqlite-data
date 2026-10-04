@@ -34,7 +34,7 @@ Source: Apple's CKSyncEngine reference, [developer.apple.com/documentation/cloud
 
 - **Triggers** on every synced table fire the SQL functions `sqlitedata_icloud_didUpdate` / `didDelete` (Swift `SyncEngine.didUpdate`/`didDelete`) on every write. They are created `IF NOT EXISTS`, so they are not replaced when the registration (`tables:` vs `privateTables:`) changes.
 - **Metadata database** `.<App>.metadata-iCloud.<container>.sqlite`, attached to the app database as schema `sqlitedata_icloud`:
-  - `sqlitedata_icloud_metadata`: one row per record (`recordPrimaryKey`, `recordType`, `zoneName`, `ownerName`, parent, `lastKnownServerRecord` blob, `_lastKnownServerRecordAllFields` blob, `hasLastKnownServerRecord` (generated), `_isDeleted`, `userModificationTime`). Two blobs per row make it large: **1.1 GB at 204k rows [measured]**, with a 2.25 GB WAL. `_isDeleted` is the last column, behind the blobs, so any filter on it reads the whole table.
+  - `sqlitedata_icloud_metadata`: one row per record (`recordPrimaryKey`, `recordType`, `zoneName`, `ownerName`, parent, `lastKnownServerRecord` blob, `_lastKnownServerRecordAllFields` blob, `hasLastKnownServerRecord` (generated), `userModificationTime`, `_isDeleted` (no longer written), `_pendingStatus`: `NULL`, `0` deleted, `1` deleted and re-inserted before the delete was sent; upstream #421). Two blobs per row make it large: **1.1 GB at 204k rows [measured]**, with a 2.25 GB WAL. `_pendingStatus` (added last by migration) sits behind the blobs like `_isDeleted` did, so any filter on it reads the whole table.
   - `sqlitedata_icloud_stateSerialization`: one row per scope (2 = private, 3 = shared) with CKSyncEngine's state.
   - `sqlitedata_icloud_pendingRecordZoneChanges`: in stock SQLiteData only a holding area for changes made while the engine is stopped; in our fork the overflow queue (section 5).
   - `sqlitedata_icloud_recordTypes`, `sqlitedata_icloud_unsyncedRecordIDs`.
@@ -160,12 +160,12 @@ Built: the fork (commit `a2333e7`) exposes `SyncEngine.lastSendOutcome` (observa
 
 ## 12. Upstream PRs reviewed (2026-10-04)
 
-Open `pointfreeco/sqlite-data` PRs checked against this fork's `SyncEngine.swift`. Nothing is tested yet.
+Open `pointfreeco/sqlite-data` PRs checked against this fork's `SyncEngine.swift`. Only #421 was ported and tested; the rest are untested. (#548 is ported too, see `CLAUDE.md`.)
 
 - **#543 `lastRecordZoneFetchError`: optional.** Our `.didFetchRecordZoneChanges` handler only decrements a counter, so fetch errors are invisible. If the status UI needs them, put them into the `SendOutcome` pattern rather than adding a second error property.
 - **#500 pending counts: skip.** It counts only engine state, which the fork caps at 1,000, so it would undercount; `pendingChangeCount()` already adds the buffer and the overflow table. The save/delete split is only worth taking if the UI needs it.
 - **#335 quota callback: skip.** Our quota handling already does this; the UI can read `SendOutcome.isQuotaExceeded`.
-- **#421: skip for now.** It changes the metadata schema and needs a migration. Treat it as a separate project, and only if a test shows the delete-then-reinsert loss on this fork.
+- **#421: ported.** A test showed the delete-then-reinsert loss on this fork, so it was ported with its migration (`_pendingStatus`), plus a fork addition that drops stale deletes at batch time. See `CLAUDE.md` and skill fix 7. Not yet verified on a device or against an existing install.
 
 ## Sources
 

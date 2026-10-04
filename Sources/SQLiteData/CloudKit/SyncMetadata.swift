@@ -3,6 +3,17 @@
   import StructuredQueries
   public import StructuredQueriesCore
 
+  /// The pending synchronization state of a record.
+  public enum PendingStatus: Int, Hashable, Sendable, QueryBindable, QueryDecodable,
+    QueryRepresentable
+  {
+    /// The row was deleted locally; the metadata is removed once the delete is sent.
+    case deleted = 0
+    /// The row was deleted and then inserted again with the same primary key before the delete
+    /// was sent. Cleared once the record is built for upload or merged with a server record.
+    case reinserted = 1
+  }
+
   /// A table that tracks metadata related to synchronized data.
   ///
   /// Each row of this table represents a synchronized record across all tables synchronized with
@@ -95,9 +106,8 @@
     @Column(as: CKShare?.SystemFieldsRepresentation.self)
     public let share: CKShare?
 
-    /// Determines if the metadata has been "soft" deleted. It will be fully deleted once the
-    /// next batch of pending changes is processed.
-    public let _isDeleted: Bool
+    /// The pending synchronization state of the record; `nil` for a normal record.
+    public let _pendingStatus: PendingStatus?
 
     @Column("hasLastKnownServerRecord", generated: .virtual)
     public let _hasLastKnownServerRecord: Bool
@@ -193,7 +203,7 @@
       self._hasLastKnownServerRecord = lastKnownServerRecord != nil
       self._isShared = share != nil
       self.userModificationTime = userModificationTime
-      self._isDeleted = false
+      self._pendingStatus = nil
     }
 
     package static func find(_ recordID: CKRecord.ID) -> Where<Self> {

@@ -138,6 +138,24 @@
       )
       .execute(db)
     }
+    // NB: "_isDeleted" stays (no longer written) so an older build can still open the database.
+    migrator.registerMigration("Replace _isDeleted with _pendingStatus") { db in
+      try #sql(
+        """
+        ALTER TABLE "\(raw: .sqliteDataCloudKitSchemaName)_metadata"
+        ADD COLUMN "_pendingStatus" INTEGER
+        """
+      )
+      .execute(db)
+      try #sql(
+        """
+        UPDATE "\(raw: .sqliteDataCloudKitSchemaName)_metadata"
+        SET "_pendingStatus" = 0
+        WHERE "_isDeleted" = 1
+        """
+      )
+      .execute(db)
+    }
     #if DEBUG
       try metadatabase.read { db in
         let hasSchemaChanges = try migrator.hasSchemaChanges(db)

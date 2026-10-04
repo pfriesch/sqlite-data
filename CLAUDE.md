@@ -3,7 +3,7 @@
 Fork of `pointfreeco/sqlite-data` (`pfriesch/sqlite-data`), used by an iOS app for CloudKit sync.
 
 - **No pull requests to pointfreeco/sqlite-data.** Changes live only in this fork.
-- Tests: `swift test` (337 pass). `MockSyncEngine` and `MockCloudDatabase` are faithful to CloudKit only where `Docs/MockFidelity.md` says so; the realistic behavior (send cycle, scheduling rule, throttle and cost profile, `stateUpdate`, fuzzing) is opt-in per test. Behavior that depends on real timing (deferred re-queue, throttle resume, scheduler wait length) can only be verified on a real device.
+- Tests: `swift test` (345 pass). `MockSyncEngine` and `MockCloudDatabase` are faithful to CloudKit only where `Docs/MockFidelity.md` says so; the realistic behavior (send cycle, scheduling rule, throttle and cost profile, `stateUpdate`, fuzzing) is opt-in per test. Behavior that depends on real timing (deferred re-queue, throttle resume, scheduler wait length) can only be verified on a real device.
 - Before touching anything under `Sources/SQLiteData/CloudKit`, load the `cloudkit-sync` skill (`.claude/skills/cloudkit-sync/SKILL.md`). It records what CKSyncEngine really does, what this fork changed and why, and the traps.
 
 ## Fork changes (do not undo without reading the skill)
@@ -18,6 +18,7 @@ Fork of `pointfreeco/sqlite-data` (`pfriesch/sqlite-data`), used by an iOS app f
 | `613a056` | Opt-in `resumesSendingAfterThrottle` (default off; measured harmful) |
 | `d882f3f`, `fd3679d` | `quotaExceeded` saves (the engine drops them) are re-queued after `quotaRetryDelay` (30 s, a guess), not through the after-send path, so a full account is not hit every second; `SendOutcome.isQuotaExceeded` for status UI; mock device-side throttle (code 7) |
 | "Keep children of never-uploaded parents" | A child rejected with `referenceViolation` whose parent is local and never saved by the server (no change tag; the stored server record alone is no proof) is kept, and both are re-queued after `quotaRetryDelay` instead of the child being deleted or unlinked. From upstream #548 (retry half not taken). A parent rejected for good is retried every delay |
+| "Port upstream #421: keep rows deleted and re-inserted" | Metadata `_pendingStatus` (`deleted`, `reinserted`) replaces `_isDeleted` via a migration (old column kept, unwritten); a row deleted and inserted again before the delete is sent is saved, not lost. Fork addition: stale deletes are dropped at batch time instead of relying on the engine to replace them. `quotaRetryDelay` is per engine (tests no longer race on a static) |
 
 A watchdog that restarted the engine when idle (`3f5cb14`) was reverted (`7fb3fa6`). Do not bring it back: it hid the cause.
 
@@ -25,7 +26,7 @@ A watchdog that restarted the engine when idle (`3f5cb14`) was reverted (`7fb3fa
 
 - Never debug-log or commit temporary probes (timing logs, `dbg()` file writers, `SQLITEDATA_FORCE_CONFLICTS` harness). Keep them as local patches outside the repo.
 - Never await a `CKSyncEngine` call from a Task created inside a delegate callback; use `Task.detached`.
-- Do not reorder the metadata table schema on current evidence (see skill, "Open questions").
+- Do not reorder the metadata table schema on current evidence (see skill, "Open questions"). Adding columns needs a migration; migrations already released must not be edited (DEBUG assert in `Metadatabase.swift`).
 
 ## Docs
 
