@@ -152,6 +152,7 @@
       if let profile = database.profile.value {
         database.advanceSimulatedTime(by: profile.schedulerWaitSeconds)
       }
+      database.restoreFuzzedAccountStatus()
       state.isSchedulerWaiting.setValue(false)
       if !state.pendingRecordZoneChanges.isEmpty { state.isSendScheduled.setValue(true) }
     }
@@ -204,13 +205,21 @@
         }
       }
 
+      // NB: Like the real engine, the batch's changes leave the pending list and stay in flight
+      //     until the request ends.
+      state.markInFlight(
+        recordsToSave.map { .saveRecord($0.recordID) } + recordIDsToDelete.map { .deleteRecord($0) }
+      )
       return CKSyncEngine.RecordZoneChangeBatch(
         recordsToSave: recordsToSave,
         recordIDsToDelete: recordIDsToDelete
       )
     }
 
+    /// Cancelling (or a crash) between building a batch and its result puts the batch's changes
+    /// back in the pending list; nothing is lost.
     package func cancelOperations() async {
+      state.requeueInFlight()
     }
   }
 
@@ -239,6 +248,29 @@
     /// Set after a send cycle ended on a transient refusal: the real engine hands the retry to the
     /// system scheduler and sends nothing until then. Cleared by ``MockSyncEngine/advanceScheduler()``.
     package let isSchedulerWaiting = LockIsolated(false)
+    package let _inFlightRecordZoneChanges = LockIsolated<
+      OrderedSet<CKSyncEngine.PendingRecordZoneChange>
+    >([])
+    package var inFlightRecordZoneChanges: [CKSyncEngine.PendingRecordZoneChange] {
+      _inFlightRecordZoneChanges.withValue { Array($0) }
+    }
+
+    package func markInFlight(_ changes: [CKSyncEngine.PendingRecordZoneChange]) {
+      remove(pendingRecordZoneChanges: changes)
+      _inFlightRecordZoneChanges.withValue { $0.append(contentsOf: changes) }
+    }
+
+    package func finishInFlight(_ changes: [CKSyncEngine.PendingRecordZoneChange]) {
+      _inFlightRecordZoneChanges.withValue { $0.subtract(changes) }
+    }
+
+    package func requeueInFlight() {
+      let changes = _inFlightRecordZoneChanges.withValue { inFlight -> [CKSyncEngine.PendingRecordZoneChange] in
+        defer { inFlight.removeAll() }
+        return Array(inFlight)
+      }
+      add(pendingRecordZoneChanges: changes)
+    }
     package let _pendingRecordZoneChanges = LockIsolated<
       OrderedSet<CKSyncEngine.PendingRecordZoneChange>
     >([]
@@ -428,7 +460,16 @@
       syncEngine.state.remove(
         pendingRecordZoneChanges: savedRecords.map { .saveRecord($0.recordID) }
       )
-      // NB: The real engine retries a refused request itself, so those changes stay pending.
+      syncEngine.state.finishInFlight(
+        batch.recordsToSave.map { .saveRecord($0.recordID) }
+          + batch.recordIDsToDelete.map { .deleteRecord($0) }
+      )
+      // NB: The real engine retries a refused request itself, so those changes go back to pending.
+      syncEngine.state.add(
+        pendingRecordZoneChanges: failedRecordSaves.filter { $0.error.isRequestRefusal }
+          .map { .saveRecord($0.record.recordID) }
+          + failedRecordDeletes.filter { $0.value.isRequestRefusal }.keys.map { .deleteRecord($0) }
+      )
       syncEngine.state.remove(
         pendingRecordZoneChanges: failedRecordSaves.filter { !$0.error.isRequestRefusal }
           .map { .saveRecord($0.record.recordID) }
@@ -477,6 +518,13 @@
       guard !alreadyRunning else { return }
       defer { state.isSendCycleRunning.setValue(false) }
       state.isSendScheduled.setValue(false)
+
+      engine.database.fuzzAccountStatus()
+      guard try await container.accountStatus() == .available else {
+        // NB: Without an account the engine sends nothing and waits for it to come back.
+        state.isSchedulerWaiting.setValue(true)
+        return
+      }
 
       await handleEvent(.willSendChanges, syncEngine: engine)
       await postStateUpdate(engine)

@@ -289,6 +289,98 @@
         try await Task.sleep(for: .milliseconds(500))
         try await engine.sendChanges(CKSyncEngine.SendChangesOptions())
       }
+
+      // MARK: In flight, zone errors, fuzzing
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func aBatchStaysInFlightUntilItsResultAndCancellingRequeuesIt() async throws {
+        let engine = syncEngine.private
+        try await seed(2)  // 3 changes
+        let batch = await syncEngine.nextRecordZoneChangeBatch(syncEngine: engine)
+        #expect(batch?.recordsToSave.count == 3)
+        #expect(engine.state.pendingRecordZoneChanges.isEmpty)
+        #expect(engine.state.inFlightRecordZoneChanges.count == 3)
+
+        await engine.cancelOperations()
+        #expect(engine.state.pendingRecordZoneChanges.count == 3)
+        #expect(engine.state.inFlightRecordZoneChanges.isEmpty)
+
+        try await syncEngine.processPendingRecordZoneChanges(scope: .private)
+        #expect(engine.state.inFlightRecordZoneChanges.isEmpty)
+        #expect(serverRecordCount == 3)
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func quotaExceededAndUserDeletedZoneFailSaves() async throws {
+        let database = syncEngine.private.database
+        let zoneID = try #require(database.state.withValue { $0.storage.keys.first })
+        syncEngine.private.state.isRealistic.setValue(true)
+        try await seed(2)
+
+        database.state.withValue { $0.isQuotaExceeded = true }
+        try await syncEngine.runSendCycle(scope: .private)
+        #expect(syncEngine.lastSendOutcome?.errorCodes[CKError.Code.quotaExceeded.rawValue] == 3)
+
+        database.state.withValue { $0.isQuotaExceeded = false; $0.userDeletedZones = [zoneID] }
+        syncEngine.private.state.add(pendingRecordZoneChanges: [.saveRecord(Reminder.recordID(for: 1))])
+        try await syncEngine.runSendCycle(scope: .private)
+        #expect(syncEngine.lastSendOutcome?.errorCodes[CKError.Code.userDeletedZone.rawValue] == 1)
+        try await Task.sleep(for: .milliseconds(300))
+        database.state.withValue { $0.userDeletedZones = [] }
+        syncEngine.private.state.remove(
+          pendingRecordZoneChanges: syncEngine.private.state.pendingRecordZoneChanges
+        )
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test func fuzzIsOffByDefaultAndReproducibleBySeed() async throws {
+        let database = syncEngine.private.database
+        #expect(database.fuzz.value == nil)
+
+        func run(seed: UInt64) -> [String] {
+          database.setFuzz(.init(seed: seed, intensity: 0.5))
+          let zoneID = database.state.withValue { $0.storage.keys.first! }
+          for index in 0..<40 {
+            _ = try? database.modifyRecords(
+              saving: [CKRecord(recordType: "T", recordID: .init(recordName: "\(seed)-\(index)", zoneID: zoneID))]
+            )
+          }
+          return database.fuzzLog.value
+        }
+        let first = run(seed: 7)
+        #expect(!first.isEmpty && first.count < 40)
+        #expect(run(seed: 7) == first)
+        #expect(run(seed: 8) != first)
+        database.setFuzz(.init(intensity: 0))
+        #expect(database.fuzzLog.value.isEmpty)
+        _ = try database.modifyRecords(saving: [])
+        #expect(database.fuzzLog.value.isEmpty)
+        database.setFuzz(nil)
+      }
+
+      @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+      @Test(arguments: [UInt64(1), 2, 3])
+      func everythingArrivesDespiteFuzzedFailures(fuzzSeed: UInt64) async throws {
+        let engine = syncEngine.private
+        engine.state.isRealistic.setValue(true)
+        syncEngine.maxInMemoryPendingChanges.setValue(1_000)
+        try await seed(299)  // 300 changes: two batches
+        engine.database.setFuzz(.init(seed: fuzzSeed, intensity: 0.6))
+
+        var attempts = 0
+        while !engine.state.pendingRecordZoneChanges.isEmpty, attempts < 200 {
+          attempts += 1
+          engine.advanceScheduler()
+          try await engine.sendChanges(CKSyncEngine.SendChangesOptions())
+          try await Task.sleep(for: .milliseconds(150))  // deferred re-queues
+        }
+        #expect(!engine.database.fuzzLog.value.isEmpty)
+        #expect(engine.state.pendingRecordZoneChanges.isEmpty)
+        #expect(serverRecordCount == 300)
+
+        engine.database.setFuzz(nil)
+        engine.advanceScheduler()
+      }
     }
   }
 #endif

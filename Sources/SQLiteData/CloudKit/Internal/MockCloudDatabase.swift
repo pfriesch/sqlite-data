@@ -16,6 +16,10 @@
       package var storage: [CKRecordZone.ID: Zone] = [:]
       var assets: [AssetID: Data] = [:]
       var deletedRecords: [(CKRecord.ID, CKRecord.RecordType)] = []
+      /// Saves into these zones fail with `userDeletedZone` (the user purged the zone in Settings).
+      package var userDeletedZones: Set<CKRecordZone.ID> = []
+      /// Saves fail with `quotaExceeded`; deletes still work.
+      package var isQuotaExceeded = false
       /// Change tags count per zone, like the per-zone change tokens they are fetched by.
       mutating func nextRecordChangeTag(in zoneID: CKRecordZone.ID) -> Int {
         lastRecordChangeTags[zoneID, default: 0] += 1
@@ -146,6 +150,100 @@
     package let simulatedSeconds = LockIsolated(0.0)
     private let bucket = LockIsolated<(tokens: Double, at: Double)?>(nil)
 
+    /// Random faults for unexpected iCloud behavior, off by default. Reproducible: the same seed
+    /// and the same requests give the same faults (see ``fuzzLog``).
+    package struct Fuzz: Sendable {
+      package struct Faults: OptionSet, Sendable {
+        package let rawValue: Int
+        package init(rawValue: Int) { self.rawValue = rawValue }
+        /// A request is refused as a whole: `serviceUnavailable`, `requestRateLimited`,
+        /// `zoneBusy`, `networkFailure`, `networkUnavailable`.
+        package static let refusals = Faults(rawValue: 1)
+        /// A request fails with `notAuthenticated` or `accountTemporarilyUnavailable`.
+        package static let accountErrors = Faults(rawValue: 2)
+        /// The account status flips to `noAccount`, `restricted`, `temporarilyUnavailable` or
+        /// `couldNotDetermine` when a send cycle starts, and returns when the scheduler fires.
+        package static let accountStatus = Faults(rawValue: 4)
+        package static let all: Faults = [.refusals, .accountErrors, .accountStatus]
+      }
+      package var seed: UInt64
+      /// Chance (0...1) that a request, or a send cycle for `.accountStatus`, gets a fault.
+      package var intensity: Double
+      package var faults: Faults
+      package init(seed: UInt64 = 0, intensity: Double, faults: Faults = .all) {
+        self.seed = seed
+        self.intensity = intensity
+        self.faults = faults
+      }
+    }
+
+    package let fuzz = LockIsolated<Fuzz?>(nil)
+    /// What the fuzzer injected, in order.
+    package let fuzzLog = LockIsolated<[String]>([])
+    private let fuzzState = LockIsolated<UInt64>(0)
+
+    package func setFuzz(_ fuzz: Fuzz?) {
+      self.fuzz.setValue(fuzz)
+      fuzzState.setValue(fuzz?.seed ?? 0)
+      fuzzLog.setValue([])
+    }
+
+    /// SplitMix64, mapped to 0..<1.
+    private func nextRandom() -> Double {
+      fuzzState.withValue { state in
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        z ^= z >> 31
+        return Double(z >> 11) / Double(1 << 53)
+      }
+    }
+
+    private func fuzzedRequestError() -> CKError? {
+      guard let fuzz = fuzz.value, nextRandom() < fuzz.intensity else { return nil }
+      var candidates: [(String, CKError)] = []
+      if fuzz.faults.contains(.refusals) {
+        let retryAfter = (11 + nextRandom() * 60).rounded()
+        candidates += [
+          ("serviceUnavailable", .throttled(retryAfter: retryAfter)),
+          ("requestRateLimited", CKError(.requestRateLimited, userInfo: [CKErrorRetryAfterKey: retryAfter])),
+          ("zoneBusy", CKError(.zoneBusy)),
+          ("networkFailure", CKError(.networkFailure)),
+          ("networkUnavailable", CKError(.networkUnavailable)),
+        ]
+      }
+      if fuzz.faults.contains(.accountErrors) {
+        candidates += [
+          ("notAuthenticated", CKError(.notAuthenticated)),
+          ("accountTemporarilyUnavailable", CKError(.accountTemporarilyUnavailable)),
+        ]
+      }
+      guard !candidates.isEmpty else { return nil }
+      let (name, error) = candidates[Int(nextRandom() * Double(candidates.count)) % candidates.count]
+      fuzzLog.withValue { $0.append(name) }
+      return error
+    }
+
+    /// May flip the account status away from `.available`; called when a send cycle starts.
+    package func fuzzAccountStatus() {
+      guard let fuzz = fuzz.value, fuzz.faults.contains(.accountStatus),
+        nextRandom() < fuzz.intensity
+      else { return }
+      let statuses: [CKAccountStatus] = [
+        .noAccount, .restricted, .temporarilyUnavailable, .couldNotDetermine,
+      ]
+      let status = statuses[Int(nextRandom() * 4) % 4]
+      container._accountStatus.setValue(status)
+      fuzzLog.withValue { $0.append("accountStatus \(status.rawValue)") }
+    }
+
+    /// The account comes back, as it does when the system scheduler fires after an outage.
+    package func restoreFuzzedAccountStatus() {
+      guard fuzz.value?.faults.contains(.accountStatus) == true else { return }
+      container._accountStatus.setValue(.available)
+    }
+
     package func advanceSimulatedTime(by seconds: Double) {
       simulatedSeconds.withValue { $0 += seconds }
     }
@@ -178,6 +276,7 @@
       saveResults: [CKRecord.ID: Result<CKRecord, any Error>],
       deleteResults: [CKRecord.ID: Result<Void, any Error>]
     ) {
+      if let error = fuzzedRequestError() { throw error }
       guard let profile = profile.value
       else {
         return try applyModifyRecords(
@@ -248,6 +347,15 @@
               // NB: Emit 'permissionFailure' if saving to shared database with no parent reference
               //     or share reference.
               saveResults[recordToSave.recordID] = .failure(CKError(.permissionFailure))
+              continue
+            }
+
+            if state.userDeletedZones.contains(recordToSave.recordID.zoneID) {
+              saveResults[recordToSave.recordID] = .failure(CKError(.userDeletedZone))
+              continue
+            }
+            if state.isQuotaExceeded {
+              saveResults[recordToSave.recordID] = .failure(CKError(.quotaExceeded))
               continue
             }
 
@@ -556,7 +664,7 @@
     var isRequestRefusal: Bool {
       switch code {
       case .serviceUnavailable, .requestRateLimited, .zoneBusy, .networkFailure,
-        .networkUnavailable, .limitExceeded:
+        .networkUnavailable, .limitExceeded, .notAuthenticated, .accountTemporarilyUnavailable:
         true
       default:
         false

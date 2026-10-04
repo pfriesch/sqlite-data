@@ -51,7 +51,9 @@ Done, tested in `RealisticMockTests`: steps 1-4 of the design, in part.
 - Fetch (item 5): per-zone tokens, records in change-tag order, pages of 200 (`deliveredFetchPages`), `expireChangeToken(zoneID:)` answers `changeTokenExpired` and forces a full fetch. Events and paging only in realistic mode; otherwise one event as before.
 - Clock and rate limit (item 6): done as the simulated clock and token bucket of the profile, not as an injected `Clock`.
 - Small fixes (item 7): `.changedKeys`/`.allKeys` supported (no tag check; `.changedKeys` and the default policy keep unchanged keys from the stored record, `.allKeys` replaces it); change tags count per zone. Not done: `cancelOperations` (nothing is in flight in the mock), the `OrderedSet` dedup question stays **[assumed]**.
-- Not done: in-flight tracking (deviation 6), zone-level errors (deviation 9), per-field server merge beyond changed keys.
+- In flight (deviation 6): a built batch leaves pending and stays in `inFlightRecordZoneChanges` until its result; `cancelOperations()` puts it back.
+- Zone errors (deviation 9): `database.state.isQuotaExceeded`, `userDeletedZone` per zone, `changeTokenExpired`; `zoneBusy`/`networkFailure` through `failNextRequests`.
+- Opt-in fuzzing, `database.setFuzz(.init(seed:intensity:faults:))`: per request (or per send cycle for the account status) a fault fires with probability `intensity`: refusals (6, 7, 23, 3, 4), account errors (9, 36), account status flips (`noAccount`, `restricted`, ...) that end when the scheduler fires. Seeded and logged in `fuzzLog`; off by default. Tests assert that everything still arrives for seeds 1-3 at intensity 0.6. Not fuzzed: sign-out/switch events (they delete local data without a delegate), per-record errors.
 
 ## Order of work and risk
 
