@@ -1,6 +1,6 @@
 # CloudKit sync internals: CKSyncEngine, SQLiteData and this fork
 
-_Reference written 2026-10-03/04 from work on a real app (iPhone 13, iOS 27.0.1, CloudKit Development environment, 190k records) with sqlite-data 1.12.0 plus this fork. Facts are marked **[Apple]** (Apple documentation), **[measured]** (observed on the device), **[forum]** (reported by other developers) or **[assumed]** (not verified). How the test mock differs from all of this: [MockFidelity.md](MockFidelity.md)._
+_Reference written 2026-10-03/04 from work on a real app with a large backlog, using sqlite-data plus this fork. Facts are marked **[Apple]** (Apple documentation), **[measured]** (observed on a real device), **[forum]** (reported by other developers) or **[assumed]** (not verified). How the test mock differs from all of this: [MockFidelity.md](MockFidelity.md)._
 
 ## 1. The layers
 
@@ -88,7 +88,7 @@ Observed sequence with stock behavior:
 
 With the same re-queue done 300 ms later from a detached task (after `didSendChanges`): about 1 s later `willFetchChanges`, `didFetchChanges`, `willSendChanges`, next batch. Repeated for dozens of forced failures without stalling.
 
-Conclusion: adding changes from inside a `sentRecordZoneChanges` callback does not make the engine send again; adding them after the operation ended does. This matches an Apple Developer Forums report ([thread 829402](https://developer.apple.com/forums/thread/829402): changes added with `add(pendingRecordZoneChanges:)` while handling `sentRecordZoneChanges`/`fetchedRecordZoneChanges` are not sent until the app is relaunched; reported on iOS 26.5; Apple asked for a Feedback report, no conclusion there) and the documented rule that adding only schedules a sync when none is scheduled (an operation that is still running counts). We see it on iOS 27.0.1 too.
+Conclusion: adding changes from inside a `sentRecordZoneChanges` callback does not make the engine send again; adding them after the operation ended does. This matches an Apple Developer Forums report ([thread 829402](https://developer.apple.com/forums/thread/829402): changes added with `add(pendingRecordZoneChanges:)` while handling `sentRecordZoneChanges`/`fetchedRecordZoneChanges` are not sent until the app is relaunched; reported on iOS 26.5; Apple asked for a Feedback report, no conclusion there) and the documented rule that adding only schedules a sync when none is scheduled (an operation that is still running counts). We see it on current iOS too.
 
 Related gotcha: awaiting a `CKSyncEngine` call from a task created inside a delegate callback traps ("BUG IN CLIENT OF CLOUDKIT: Cannot await a call into CKSyncEngine from within a delegate callback ...") because the task inherits CloudKit's task-local. Use `Task.detached`.
 
@@ -136,11 +136,11 @@ Built: the fork (commit `a2333e7`) exposes `SyncEngine.lastSendOutcome` (observa
 
 - Is the post-callback re-queue the intended usage? Apple's sample code README does not say where `state.add` is called; filing a Feedback with the reproduction recipe would settle it.
 - How long does the engine wait after `serviceUnavailable`? Answered in part: it does not follow the server's retry-after (25 s); it schedules a system activity and stayed silent 12+ minutes in the foreground. How long until iOS runs it is still unknown.
-- Upload speed: 6-13 s per 250 records on the Development environment; Production not measured.
+- Upload speed: 6-13 s per 250 records ; other CloudKit environments not measured.
 - The bounded queue is outside the stock design (engine state = whole queue); Apple documents no limit on pending changes, but 40k+ failed for us.
 - Record count dominates upload time (about 1,200 records/min is the rough ceiling); packing many small rows into one record cuts the load but is at odds with the typed-columns rule.
 
-## 11. Measurements (iPhone 13, Development environment)
+## 11. Measurements
 
 - **One engine cycle, 250 records:** build the batch 1.4 s (0.8-1.9; per record one metadata read, one user-DB read and one write transaction), CloudKit 3.6 s (2.4-4.4), handle the result 0.4 s; about 6.3 s per cycle, 2,360 records/min. A raw `CKDatabase.modifyRecords` of the same 250 records took 1.7-2.4 s. The engine's operations run at `qos=Utility` through a "container throttle queue" (in-process log). **[measured]**
 - **Record size does not matter below ~3 KB:** 250 records of 40 B, 200 B and 3 KB all took 1.8-2.2 s raw; 250 x 20 KB (5 MB) was rejected (request size limit; Apple: 400 items and 2 MB per request). Count, not size, is the cost. **[measured]**
@@ -177,5 +177,5 @@ After a refused request (`serviceUnavailable` with retry-after, or `partialFailu
 
 **In the app:** Settings > iCloud details > "Retry right after iCloud's wait time" (`UserDefaults` key `cloudSyncResumeAfterThrottle`, applied when the engine is attached and when toggled).
 
-**Result of the device test (2026-10-04, iPhone 13, Development): it did not help, it made it worse.** With the option on, 390 s of running: after the first refusal every forced `sendChanges()` (fired 21-42 s later, at or after the stated retry-after) was refused again (`serviceUnavailable` 34-43 s, then `requestRateLimited` 19-40 s) and **0 records were saved**; 12 consecutive refusals, each with a fresh retry-after. The same build with the option off (same conditions) went from a refusal at 78 s to successful 250-record batches at 155 s and 300 s: the engine's own scheduled retries got through (gaps of 44 s, 32 s and 130 s). Two retriers (the engine's own and ours) double the request rate while the server is already refusing. One run each, so not conclusive, but the direction is clear: **leave it off**. A better version would back off beyond the retry-after (for example 2x, growing) or only fire when the engine has been silent longer than a few minutes.
+**Result of the device test (2026-10-04): it did not help, it made it worse.** With the option on, 390 s of running: after the first refusal every forced `sendChanges()` (fired 21-42 s later, at or after the stated retry-after) was refused again (`serviceUnavailable` 34-43 s, then `requestRateLimited` 19-40 s) and **0 records were saved**; 12 consecutive refusals, each with a fresh retry-after. The same build with the option off (same conditions) went from a refusal at 78 s to successful 250-record batches at 155 s and 300 s: the engine's own scheduled retries got through (gaps of 44 s, 32 s and 130 s). Two retriers (the engine's own and ours) double the request rate while the server is already refusing. One run each, so not conclusive, but the direction is clear: **leave it off**. A better version would back off beyond the retry-after (for example 2x, growing) or only fire when the engine has been silent longer than a few minutes.
 

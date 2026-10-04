@@ -1,6 +1,6 @@
 # Making `MockSyncEngine` and `MockCloudDatabase` behave like CloudKit
 
-_2026-10-04. Files: `Sources/SQLiteData/CloudKit/Internal/MockSyncEngine.swift`, `MockCloudDatabase.swift`, `MockCloudContainer.swift`. Reference for what the real thing does: [CloudKitSyncInternals.md](CloudKitSyncInternals.md). "Real" below means CKSyncEngine and CloudKit as measured on an iPhone (iOS 27.0.1, Development environment)._
+_2026-10-04. Files: `Sources/SQLiteData/CloudKit/Internal/MockSyncEngine.swift`, `MockCloudDatabase.swift`, `MockCloudContainer.swift`. Reference for what the real thing does: [CloudKitSyncInternals.md](CloudKitSyncInternals.md). "Real" below means CKSyncEngine and CloudKit as measured on a real device._
 
 ## Why this matters
 
