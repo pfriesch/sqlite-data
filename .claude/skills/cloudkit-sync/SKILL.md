@@ -35,6 +35,7 @@ app → `SyncEngine` (this repo: triggers, metadata DB, record building, conflic
 4. **Awaiting CKSyncEngine inside a delegate callback traps** ("BUG IN CLIENT OF CLOUDKIT"): the Task inherits CloudKit's task-local. Use `Task.detached`.
 
 5. **A whole-table `UPDATE` blocks the app's database.** Start (new synced table) and sign-in queued every row in one write transaction; on a large table it held the writer for minutes, and in GRDB each new `ValueObservation` keeps a pool reader until it gets the writer, so the app ran out of readers. Fix: `touchRows`, 1,000 rows per transaction (keyset on primary key / rowid). Never queue a whole table in one write.
+6. **A child of a never-uploaded parent was deleted.** A child sent while its parent was still local (e.g. the parent waiting out `quotaExceeded`) fails with `referenceViolation`, and the handler treated that as a remote delete: cascade deleted the child, set null / set default unlinked it. Fix (from upstream #548, without its immediate quota retry): if the parent's metadata is not deleted and its stored server record has no change tag, re-queue parent and child after `quotaRetryDelay`. The stored server record alone is no proof of upload: it is written when the batch is built. Read metadata through `metadatabase`, not `userDatabase` (no such table there). A parent rejected for good is retried every delay. Test: `ReferenceViolationTests.addReminderToListThatWasNeverUploaded`.
 
 ## Throttling and the engine going quiet [measured]
 

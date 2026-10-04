@@ -16,6 +16,7 @@ Fork of `pointfreeco/sqlite-data` (`pfriesch/sqlite-data`), used by an iOS app f
 | `5726285` | `nextRecordZoneChangeBatch` prefetches metadata and rows for the first 250 changes and writes last-known server records once per batch (was per record); not timed on a device |
 | "Queue whole tables in short write transactions" | `touchRows`: queueing a new table (start) or unknown records (sign-in) runs in 1,000-row write transactions instead of one; the single transaction stalled the app behind the writer |
 | `613a056` | Opt-in `resumesSendingAfterThrottle` (default off; measured harmful) |
+| `d882f3f`, `fd3679d` | `quotaExceeded` saves (the engine drops them) are re-queued after `quotaRetryDelay` (30 s, a guess), not through the after-send path, so a full account is not hit every second; `SendOutcome.isQuotaExceeded` for status UI; mock device-side throttle (code 7) |
 | "Keep children of never-uploaded parents" | A child rejected with `referenceViolation` whose parent is local and never saved by the server (no change tag; the stored server record alone is no proof) is kept, and both are re-queued after `quotaRetryDelay` instead of the child being deleted or unlinked. From upstream #548 (retry half not taken). A parent rejected for good is retried every delay |
 
 A watchdog that restarted the engine when idle (`3f5cb14`) was reverted (`7fb3fa6`). Do not bring it back: it hid the cause.
